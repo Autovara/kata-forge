@@ -58,6 +58,19 @@ def _iter_py(repo: Path):
         yield py
 
 
+def iter_repo_hosts(repo: str | Path) -> dict[str, int]:
+    """External hosts referenced in the repo (noise hosts filtered), as host -> reference count."""
+    repo = Path(repo).expanduser()
+    counts: dict[str, int] = {}
+    for py in _iter_py(repo):
+        text = py.read_text(encoding="utf-8", errors="ignore")
+        for match in _URL.finditer(text):
+            host = re.sub(r"^https?://", "", match.group(0)).split("/")[0].rstrip(".,)")
+            if host and not any(noise in host for noise in _URL_NOISE):
+                counts[host] = counts.get(host, 0) + 1
+    return counts
+
+
 def _snippet(lines: list[str], lineno: int, n: int = 2) -> str:
     start = max(0, lineno - 1)
     return "\n".join(lines[start : start + n]).strip()

@@ -94,6 +94,18 @@ def _run_extract(args: argparse.Namespace) -> int:
         else:
             print(f"    {kind}: (not found)")
 
+    from kata_forge.secrets import extract_secrets
+
+    secret_report = extract_secrets(resolved.path)
+    if secret_report.required_secrets or secret_report.allowed_hosts:
+        print("  egress:")
+        if secret_report.required_secrets:
+            print(f"    secrets: {', '.join(secret_report.required_secrets)}")
+        if secret_report.allowed_hosts:
+            print(f"    hosts: {', '.join(secret_report.allowed_hosts)}")
+        paid = secret_report.paid_providers
+        print(f"    paid providers: {', '.join(paid) if paid else 'none (free-tier only)'}")
+
     if not args.out:
         print("  tip: pass --out DIR to write the analysis report (+ --pack/--evaluator for a scaffold)")
         return 0
