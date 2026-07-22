@@ -40,11 +40,40 @@ def build_parser() -> argparse.ArgumentParser:
     lane.add_argument("--env", default="", help="An existing .env to emit a reviewable patch against.")
     lane.add_argument("--out", default="", help="Write the patch to this file instead of stdout.")
 
+    extract = subcommands.add_parser("extract", help="Resolve a validator repo for auto-extract.")
+    extract.add_argument("--repo", default="", help="Validator repo url or local path.")
+    extract.add_argument("--subnet", type=int, default=0, help="Subnet number (needs a resolver).")
+    extract.add_argument("--commit", default="", help="Pin the repo at this commit.")
+    extract.add_argument("--work-dir", default="", help="Where to clone a remote repo.")
+
     return parser
+
+
+def _run_extract(args: argparse.Namespace) -> int:
+    from kata_forge.resolver import RepoResolveError, resolve_repo
+
+    try:
+        resolved = resolve_repo(
+            repo=args.repo or None,
+            subnet=args.subnet or None,
+            commit=args.commit or None,
+            work_dir=args.work_dir or None,
+        )
+    except RepoResolveError as error:
+        print(f"kata-forge: error: {error}", file=sys.stderr)
+        return 2
+    print(f"kata-forge: resolved {resolved.source}")
+    print(f"  path:   {resolved.path}")
+    print(f"  commit: {resolved.commit or '(not a git repo)'}")
+    print(f"  cloned: {resolved.was_cloned}")
+    print("  next: dependency classification + anchor extraction (M3.2-M3.4)")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "extract":  # extract takes --repo/--subnet, not a full spec
+        return _run_extract(args)
     try:
         spec = spec_from_args(args)
     except SpecError as error:
