@@ -52,7 +52,24 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--name", default="", help="Display slug for the scaffold.")
     extract.add_argument("--force", action="store_true", help="Overwrite an existing scaffold.")
 
+    survey = subcommands.add_parser("survey", help="Rank many local repos as onboarding candidates.")
+    survey.add_argument("paths", nargs="+", help="Local repo paths to analyze and rank.")
+    survey.add_argument("--out", default="", help="Write the ranked table to this file.")
+
     return parser
+
+
+def _run_survey(args: argparse.Namespace) -> int:
+    from kata_forge.batch import render_survey_table, survey
+
+    rows = survey(list(args.paths))
+    table = render_survey_table(rows)
+    if args.out:
+        Path(args.out).expanduser().write_text(table, encoding="utf-8")
+        print(f"kata-forge: wrote survey of {len(rows)} repos to {args.out}")
+    else:
+        print(table, end="")
+    return 0
 
 
 def _run_extract(args: argparse.Namespace) -> int:
@@ -151,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "extract":  # extract takes --repo/--subnet, not a full spec
         return _run_extract(args)
+    if args.command == "survey":  # survey takes repo paths, not a spec
+        return _run_survey(args)
     try:
         spec = spec_from_args(args)
     except SpecError as error:
