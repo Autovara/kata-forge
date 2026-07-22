@@ -84,9 +84,11 @@ def test_cli_extract_local_repo(tmp_path, capsys) -> None:
     assert "commit:" in capsys.readouterr().out
 
 
-def test_cli_extract_subnet_without_resolver_errors(capsys) -> None:
+def test_cli_extract_subnet_without_repo_falls_back_to_chain(capsys) -> None:
+    # --subnet with no --repo now tries the chain resolver; with no chain reachable here it
+    # degrades cleanly to rc 2 with the "pass --repo" hint (bittensor missing or unreachable).
     assert main(["extract", "--subnet", "126"]) == 2
-    assert "resolver" in capsys.readouterr().err
+    assert "--repo" in capsys.readouterr().err
 
 
 @pytest.mark.skipif(not POKER44.exists(), reason="poker44 clone not present")

@@ -58,12 +58,18 @@ def build_parser() -> argparse.ArgumentParser:
 def _run_extract(args: argparse.Namespace) -> int:
     from kata_forge.resolver import RepoResolveError, resolve_repo
 
+    resolver = None
+    if not args.repo and args.subnet:  # no repo given -> resolve the subnet from the chain
+        from kata_forge.chain import chain_resolver
+
+        resolver = chain_resolver()
     try:
         resolved = resolve_repo(
             repo=args.repo or None,
             subnet=args.subnet or None,
             commit=args.commit or None,
             work_dir=args.work_dir or None,
+            resolver=resolver,
         )
     except RepoResolveError as error:
         print(f"kata-forge: error: {error}", file=sys.stderr)
