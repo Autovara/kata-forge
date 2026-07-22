@@ -79,6 +79,13 @@ def test_agent_main_is_top_miner_when_no_synapse(tmp_path) -> None:
     assert report.miner.symbol == "agent_main"
 
 
+def test_canonical_source_beats_docs_tutorial(tmp_path) -> None:
+    _write(tmp_path, "docs/tutorial/protocol.py", "import bittensor as bt\nclass DocSynapse(bt.Synapse): pass\n")
+    _write(tmp_path, "pkg/protocol.py", "import bittensor as bt\nclass RealSynapse(bt.Synapse): pass\n")
+    report = extract_anchors(tmp_path)
+    assert report.miner.symbol == "RealSynapse"  # docs/ demoted below real source
+
+
 def test_noise_urls_and_tests_dir_excluded(tmp_path) -> None:
     _write(tmp_path, "u.py", 'X = "https://github.com/org/repo"\nY = "https://pypi.org/simple"')
     _write(tmp_path, "tests/test_x.py", "def reward(a, b) -> float: return 1.0")

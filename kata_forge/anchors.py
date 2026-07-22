@@ -24,6 +24,8 @@ _URL_NOISE = ("github.com", "githubusercontent", "pypi.org", "readthedocs", "sch
 _SCORER_NAMES = ("reward", "score", "evaluate", "compute_reward", "compute_score", "get_reward")
 _MINER_FUNCS = ("agent_main", "forward", "run_agent", "infer", "predict", "generate")
 _SCORER_ARGS = ("pred", "true", "label", "target", "y_", "gold", "expected", "actual")
+# Path segments that mark tutorial/example code -- demoted so canonical source wins ties.
+_DEMOTE_DIRS = {"docs", "doc", "examples", "example", "tutorial", "tutorials", "samples", "sample"}
 
 
 @dataclass(frozen=True)
@@ -72,6 +74,10 @@ def _arg_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
 
 def _confidence(points: int) -> str:
     return "high" if points >= 4 else "medium" if points >= 2 else "low"
+
+
+def _path_penalty(rel: str) -> int:
+    return 3 if any(part in _DEMOTE_DIRS for part in Path(rel).parts) else 0
 
 
 def _score_scorer(node, rel: str) -> tuple[int, str] | None:
@@ -139,19 +145,20 @@ def _collect(repo: Path):
         except SyntaxError:
             continue
         for node in ast.walk(tree):
+            penalty = _path_penalty(rel)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 scored = _score_scorer(node, rel)
                 if scored:
-                    pts, detail = scored
+                    pts, detail = scored[0] - penalty, scored[1]
                     scorers.append((pts, Anchor("scorer", rel, node.name, node.lineno, detail, _snippet(lines, node.lineno), _confidence(pts))))
                 mined = _score_miner_func(node, rel)
                 if mined:
-                    pts, detail = mined
+                    pts, detail = mined[0] - penalty, mined[1]
                     miners.append((pts, Anchor("miner", rel, node.name, node.lineno, detail, _snippet(lines, node.lineno), _confidence(pts))))
             elif isinstance(node, ast.ClassDef):
                 mined = _score_miner_class(node, rel)
                 if mined:
-                    pts, detail = mined
+                    pts, detail = mined[0] - penalty, mined[1]
                     miners.append((pts, Anchor("miner", rel, node.name, node.lineno, detail, _snippet(lines, node.lineno), _confidence(pts))))
     return scorers, miners, urls
 
