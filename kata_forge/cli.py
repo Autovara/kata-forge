@@ -35,6 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_spec_arguments(lane)
     lane.add_argument("--release-path", default="", help="Host path to a pinned benchmark release.")
     lane.add_argument("--sample-size", type=int, default=0, help="Groups sampled per challenge.")
+    lane.add_argument("--org", default="Autovara", help="GitHub org for source_repos.")
+    lane.add_argument("--srv-root", default="/srv", help="Deploy root for the editable path.")
+    lane.add_argument("--env", default="", help="An existing .env to emit a reviewable patch against.")
+    lane.add_argument("--out", default="", help="Write the patch to this file instead of stdout.")
 
     return parser
 
@@ -62,11 +66,30 @@ def main(argv: list[str] | None = None) -> int:
         print("  next: fill sample_problems / run_candidate / score / compare (see kata-sn126)")
         return 0
     if args.command == "lane-config":
-        # F4 emits the KATA_LANES snippet + patch here.
-        print(
-            f"kata-forge: validated lane {spec.pack} (evaluator={spec.evaluator_id}). "
-            "Config emission lands in F4."
+        from kata_forge.lane_config import editable_path, env_patch, lane_entry, render_snippet
+
+        path = editable_path(spec, args.srv_root)
+        entry = lane_entry(
+            spec,
+            org=args.org,
+            release_path=args.release_path or None,
+            sample_size=args.sample_size or None,
         )
+        print(render_snippet(spec, entry, path))
+        if args.env:
+            env_file = Path(args.env).expanduser()
+            if not env_file.is_file():
+                print(f"kata-forge: error: no .env at {args.env}", file=sys.stderr)
+                return 2
+            patch = env_patch(env_file.read_text(encoding="utf-8"), entry, path)
+            if not patch:
+                print("\nkata-forge: .env already has this lane; no change needed.")
+            elif args.out:
+                Path(args.out).expanduser().write_text(patch, encoding="utf-8")
+                print(f"\nkata-forge: wrote reviewable patch to {args.out} (apply with `git apply`)")
+            else:
+                print("\n--- reviewable patch (apply with `git apply`) ---")
+                print(patch, end="")
         return 0
     return 0
 

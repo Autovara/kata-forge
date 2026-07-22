@@ -10,7 +10,9 @@ other repos**. Design & progress: `kata-forge-plan.md`.
 - [x] **F1** — repo skeleton + CLI harness (spec validation)
 - [x] **F2** — templates + generator (`new` scaffolds a kata-sn<N> skeleton)
 - [x] **F3** — validated by reproduction (generated skeleton installs + is discoverable)
-- [ ] F4 — config artifact (KATA_LANES snippet + patch)
+- [x] **F4** — config artifact (`lane-config` emits KATA_LANES snippet + reviewable `.env` patch)
+
+**M2 complete.** `kata-forge new` scaffolds an installable, discoverable kata-sn<N>; `kata-forge lane-config` emits the reviewable go-live config.
 
 ## Dev
 

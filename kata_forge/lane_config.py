@@ -1,0 +1,117 @@
+"""Emit the kata-bot lane config for a subnet as a reviewable artifact.
+
+Given a spec, produce (a) the single ``KATA_LANES`` entry + editable-path addition, as a
+human-readable snippet, and (b) a unified ``.patch`` against an existing ``.env`` that adds
+them idempotently. **It never writes the ``.env``** -- the operator reviews and applies.
+"""
+
+from __future__ import annotations
+
+import difflib
+import json
+from typing import Any
+
+from kata_forge.spec import SubnetSpec
+
+DEFAULT_ORG = "Autovara"
+DEFAULT_SRV_ROOT = "/srv"
+_LANES_KEY = "KATA_LANES"
+_PATHS_KEY = "KATA_SUBNET_PLUGIN_EDITABLE_PATHS"
+
+
+def editable_path(spec: SubnetSpec, srv_root: str = DEFAULT_SRV_ROOT) -> str:
+    return f"{srv_root.rstrip('/')}/{spec.repo_name}"
+
+
+def lane_entry(
+    spec: SubnetSpec,
+    *,
+    org: str = DEFAULT_ORG,
+    release_path: str | None = None,
+    sample_size: int | None = None,
+) -> dict[str, Any]:
+    """The one ``KATA_LANES`` entry for this subnet."""
+    challenge_config: dict[str, Any] = {}
+    if release_path:
+        challenge_config["pinned_release_path"] = release_path
+    if sample_size:
+        challenge_config["sample_size"] = int(sample_size)
+    return {
+        "lane_id": spec.pack,
+        "pack": spec.pack,
+        "mode": spec.mode,
+        "evaluator": spec.evaluator_id,
+        "source_repos": [f"{org}/{spec.repo_name}"],
+        "challenge_config": challenge_config,
+    }
+
+
+def render_snippet(spec: SubnetSpec, entry: dict[str, Any], path: str) -> str:
+    """A human-readable go-live block: the lane entry + editable path + install/restart."""
+    return "\n".join(
+        [
+            f"# Add the SN{spec.subnet_number} lane to kata-bot (.env) -- keep existing lanes:",
+            "",
+            f"# 1. install:  uv pip install -e {path}",
+            f"# 2. append this object to {_LANES_KEY}:",
+            "     " + json.dumps(entry, separators=(",", ":")),
+            f"# 3. append to {_PATHS_KEY}:",
+            f"     :{path}",
+            "# 4. restart the validator.",
+        ]
+    )
+
+
+def _split_env_value(line: str, key: str) -> str | None:
+    prefix = f"{key}="
+    if not line.startswith(prefix):
+        return None
+    value = line[len(prefix) :]
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value
+
+
+def apply_lane_to_env(env_text: str, entry: dict[str, Any], path: str) -> str:
+    """Return ``env_text`` with the lane entry + editable path added (idempotent)."""
+    lines = env_text.splitlines()
+    lanes_done = paths_done = False
+    for index, line in enumerate(lines):
+        raw_lanes = _split_env_value(line, _LANES_KEY)
+        if raw_lanes is not None:
+            lanes = json.loads(raw_lanes) if raw_lanes.strip() else []
+            if not any(existing.get("lane_id") == entry["lane_id"] for existing in lanes):
+                lanes.append(entry)
+            lines[index] = f"{_LANES_KEY}='{json.dumps(lanes, separators=(',', ':'))}'"
+            lanes_done = True
+            continue
+        raw_paths = _split_env_value(line, _PATHS_KEY)
+        if raw_paths is not None:
+            paths = [segment for segment in raw_paths.split(":") if segment]
+            if path not in paths:
+                paths.append(path)
+            lines[index] = f"{_PATHS_KEY}={':'.join(paths)}"
+            paths_done = True
+    if not lanes_done:
+        lines.append(f"{_LANES_KEY}='{json.dumps([entry], separators=(',', ':'))}'")
+    if not paths_done:
+        lines.append(f"{_PATHS_KEY}={path}")
+    trailing = "\n" if env_text.endswith("\n") else ""
+    return "\n".join(lines) + trailing
+
+
+def env_patch(
+    env_text: str, entry: dict[str, Any], path: str, *, env_path: str = "/srv/kata-bot/.env"
+) -> str:
+    """A unified diff adding the lane to ``env_text``; empty string if already present."""
+    modified = apply_lane_to_env(env_text, entry, path)
+    if modified == env_text:
+        return ""
+    rel = env_path.lstrip("/")  # git-style a/<path>, no double slash on an absolute path
+    diff = difflib.unified_diff(
+        env_text.splitlines(keepends=True),
+        modified.splitlines(keepends=True),
+        fromfile=f"a/{rel}",
+        tofile=f"b/{rel}",
+    )
+    return "".join(diff)
