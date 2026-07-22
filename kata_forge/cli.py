@@ -40,11 +40,17 @@ def build_parser() -> argparse.ArgumentParser:
     lane.add_argument("--env", default="", help="An existing .env to emit a reviewable patch against.")
     lane.add_argument("--out", default="", help="Write the patch to this file instead of stdout.")
 
-    extract = subcommands.add_parser("extract", help="Resolve a validator repo for auto-extract.")
+    extract = subcommands.add_parser("extract", help="Analyze a validator repo and scaffold a plugin.")
     extract.add_argument("--repo", default="", help="Validator repo url or local path.")
     extract.add_argument("--subnet", type=int, default=0, help="Subnet number (needs a resolver).")
     extract.add_argument("--commit", default="", help="Pin the repo at this commit.")
     extract.add_argument("--work-dir", default="", help="Where to clone a remote repo.")
+    extract.add_argument("--out", default="", help="Write the analysis report (+scaffold) here.")
+    extract.add_argument("--pack", default="", help="Lane pack; enables the anchored scaffold.")
+    extract.add_argument("--evaluator", default="", help="Evaluator id; enables the anchored scaffold.")
+    extract.add_argument("--mode", default="miner", help="Submission mode for the scaffold.")
+    extract.add_argument("--name", default="", help="Display slug for the scaffold.")
+    extract.add_argument("--force", action="store_true", help="Overwrite an existing scaffold.")
 
     return parser
 
@@ -87,7 +93,33 @@ def _run_extract(args: argparse.Namespace) -> int:
             print(f"    {kind}: {anchor.file}:{anchor.lineno} {anchor.symbol} [{anchor.confidence}]")
         else:
             print(f"    {kind}: (not found)")
-    print("  next: report + anchored scaffold (M3.4)")
+
+    if not args.out:
+        print("  tip: pass --out DIR to write the analysis report (+ --pack/--evaluator for a scaffold)")
+        return 0
+
+    from kata_forge.report import write_extract
+    from kata_forge.spec import SpecError, validate_spec
+
+    spec = None
+    if args.pack or args.evaluator:  # a scaffold was requested
+        try:
+            spec = validate_spec(
+                subnet_number=args.subnet, pack=args.pack, evaluator_id=args.evaluator,
+                mode=args.mode, name=args.name,
+            )
+        except SpecError as error:
+            print(f"kata-forge: error: {error}", file=sys.stderr)
+            return 2
+    outputs = write_extract(
+        out_dir=args.out, subnet=args.subnet or None, resolved=resolved,
+        deps=report, anchors=anchors, spec=spec, force=args.force,
+    )
+    print(f"  wrote:  {outputs.analysis_path}")
+    if outputs.scaffold_root is not None:
+        print(f"  scaffold: {outputs.scaffold_root} ({len(outputs.scaffold_paths)} files, anchors injected)")
+    else:
+        print("  (pass --pack + --evaluator to also scaffold an anchor-annotated kata-sn<N>/)")
     return 0
 
 
