@@ -44,9 +44,13 @@ class SubnetSpec:
         return f"kata-sn{self.subnet_number}"
 
     @property
+    def base_name(self) -> str:
+        # poker44 -> Poker44 ; my_subnet -> MySubnet  (base for Plugin/Problems/RawRun classes)
+        return "".join(part.capitalize() for part in re.split(r"[-_]", self.slug) if part)
+
+    @property
     def class_name(self) -> str:
-        # poker44 -> Poker44Plugin ; my_subnet -> MySubnetPlugin
-        return "".join(part.capitalize() for part in re.split(r"[-_]", self.slug) if part) + "Plugin"
+        return f"{self.base_name}Plugin"  # Poker44Plugin
 
     @property
     def singleton(self) -> str:

@@ -7,8 +7,8 @@ from kata_forge.cli import build_parser, main
 VALID = ["--subnet", "126", "--pack", "sn126__poker44", "--evaluator", "sn126_poker44"]
 
 
-def test_new_valid_spec_returns_zero(capsys) -> None:
-    assert main(["new", *VALID]) == 0
+def test_new_valid_spec_returns_zero(tmp_path, capsys) -> None:
+    assert main(["new", *VALID, "--out", str(tmp_path)]) == 0  # --out so it never writes to cwd
     assert "kata-sn126" in capsys.readouterr().out
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from kata_forge.spec import SpecError, spec_from_args
 
@@ -47,12 +48,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "new":
-        # F2 renders the templates here; F1 only proves the spec is well-formed.
-        print(
-            f"kata-forge: validated {spec.repo_name} "
-            f"(package={spec.package}, class={spec.class_name}, evaluator={spec.evaluator_id}). "
-            "Scaffolding lands in F2."
-        )
+        from kata_forge.generator import GeneratorError, generate
+
+        try:
+            written = generate(spec, args.out, force=args.force)
+        except GeneratorError as error:
+            print(f"kata-forge: error: {error}", file=sys.stderr)
+            return 2
+        target = Path(args.out).expanduser().resolve() / spec.repo_name
+        print(f"kata-forge: scaffolded {spec.repo_name} at {target} ({len(written)} files)")
+        for path in written:
+            print(f"  {path.relative_to(target.parent)}")
+        print("  next: fill sample_problems / run_candidate / score / compare (see kata-sn126)")
         return 0
     if args.command == "lane-config":
         # F4 emits the KATA_LANES snippet + patch here.

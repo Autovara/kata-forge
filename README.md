@@ -8,7 +8,7 @@ other repos**. Design & progress: `kata-forge-plan.md`.
 ## Status
 
 - [x] **F1** — repo skeleton + CLI harness (spec validation)
-- [ ] F2 — templates + generator
+- [x] **F2** — templates + generator (`new` scaffolds a kata-sn<N> skeleton)
 - [ ] F3 — validate by reproducing kata-sn126
 - [ ] F4 — config artifact (KATA_LANES snippet + patch)
 
