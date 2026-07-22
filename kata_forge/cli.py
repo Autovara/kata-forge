@@ -62,6 +62,7 @@ def _run_extract(args: argparse.Namespace) -> int:
     except RepoResolveError as error:
         print(f"kata-forge: error: {error}", file=sys.stderr)
         return 2
+    from kata_forge.anchors import extract_anchors
     from kata_forge.deps import classify_repo
 
     print(f"kata-forge: resolved {resolved.source}")
@@ -78,7 +79,15 @@ def _run_extract(args: argparse.Namespace) -> int:
     ):
         if names:
             print(f"    {label}: {', '.join(names)}")
-    print("  next: anchor extraction + report (M3.3-M3.4)")
+    anchors = extract_anchors(resolved.path)
+    print("  anchors:")
+    for kind in ("scorer", "benchmark", "miner"):
+        anchor = getattr(anchors, kind)
+        if anchor:
+            print(f"    {kind}: {anchor.file}:{anchor.lineno} {anchor.symbol} [{anchor.confidence}]")
+        else:
+            print(f"    {kind}: (not found)")
+    print("  next: report + anchored scaffold (M3.4)")
     return 0
 
 
