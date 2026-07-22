@@ -109,13 +109,20 @@ def render_analysis(
     return "\n".join(lines) + "\n"
 
 
-def inject_anchor_todos(plugin_source: str, anchors: AnchorReport) -> str:
-    """Insert a ``# >>> ANCHOR`` comment above each stub method whose source anchor was found."""
+def inject_anchor_todos(
+    plugin_source: str, anchors: AnchorReport, drafts: dict[str, str] | None = None
+) -> str:
+    """Insert a ``# >>> ANCHOR`` comment above each stub method whose source anchor was found.
+
+    ``drafts`` (method -> LLM-drafted text) is appended as a *comment-only* ``# LLM DRAFT`` block,
+    so it can never break the generated code -- it is a suggestion the author reviews.
+    """
     by_method: dict[str, Anchor] = {}
     for kind, method in _METHOD_FOR.items():
         anchor = getattr(anchors, kind)
         if anchor is not None:
             by_method[method] = anchor
+    drafts = drafts or {}
 
     out: list[str] = []
     for line in plugin_source.splitlines():
@@ -128,6 +135,9 @@ def inject_anchor_todos(plugin_source: str, anchors: AnchorReport) -> str:
                     f"{indent}#   {anchor.file}:{anchor.lineno}  {anchor.symbol}",
                     f"{indent}#   {anchor.detail}",
                 ]
+                if method in drafts:
+                    out.append(f"{indent}# --- LLM DRAFT (review, do not trust verbatim) ---")
+                    out += [f"{indent}# {ln}" for ln in drafts[method].splitlines()]
                 break
         out.append(line)
     return "\n".join(out) + ("\n" if plugin_source.endswith("\n") else "")
@@ -142,9 +152,14 @@ def write_extract(
     anchors: AnchorReport | None = None,
     cost: CostReport | None = None,
     spec: SubnetSpec | None = None,
+    drafter: object | None = None,
     force: bool = False,
 ) -> ExtractOutputs:
-    """Write the analysis report (always) and, given a spec, the anchor-annotated scaffold."""
+    """Write the analysis report (always) and, given a spec, the anchor-annotated scaffold.
+
+    ``drafter`` (an opt-in ``LlmDrafter``) fills each stub with a comment-only LLM draft; a drafter
+    that raises is skipped silently -- drafting is never allowed to break scaffolding.
+    """
     deps = deps or classify_repo(resolved.path)
     anchors = anchors or extract_anchors(resolved.path)
     cost = cost or estimate_cost(resolved.path, deps=deps)
@@ -163,7 +178,25 @@ def write_extract(
     scaffold_root = out / spec.repo_name
     plugin_py = next((p for p in paths if p.name == "plugin.py"), None)
     if plugin_py is not None:
+        drafts = _llm_drafts(drafter, anchors, spec) if drafter is not None else None
         plugin_py.write_text(
-            inject_anchor_todos(plugin_py.read_text(encoding="utf-8"), anchors), encoding="utf-8"
+            inject_anchor_todos(plugin_py.read_text(encoding="utf-8"), anchors, drafts),
+            encoding="utf-8",
         )
     return ExtractOutputs(analysis_path=analysis_path, scaffold_root=scaffold_root, scaffold_paths=paths)
+
+
+def _llm_drafts(drafter: object, anchors: AnchorReport, spec: SubnetSpec) -> dict[str, str]:
+    """Call the drafter per anchored stub; a drafter that raises yields no drafts (never fatal)."""
+    from kata_forge.llm import LlmUnavailable, build_prompt
+
+    drafts: dict[str, str] = {}
+    for kind, method in _METHOD_FOR.items():
+        anchor = getattr(anchors, kind)
+        if anchor is None:
+            continue
+        try:
+            drafts[method] = drafter(build_prompt(method, anchor, spec))  # type: ignore[operator]
+        except LlmUnavailable:
+            return {}
+    return drafts

@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     lane.add_argument("--srv-root", default="/srv", help="Deploy root for the editable path.")
     lane.add_argument("--env", default="", help="An existing .env to emit a reviewable patch against.")
     lane.add_argument("--out", default="", help="Write the patch to this file instead of stdout.")
+    lane.add_argument("--repo", default="", help="Validator repo to derive egress hosts + secrets from.")
 
     extract = subcommands.add_parser("extract", help="Analyze a validator repo and scaffold a plugin.")
     extract.add_argument("--repo", default="", help="Validator repo url or local path.")
@@ -51,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--mode", default="miner", help="Submission mode for the scaffold.")
     extract.add_argument("--name", default="", help="Display slug for the scaffold.")
     extract.add_argument("--force", action="store_true", help="Overwrite an existing scaffold.")
+    extract.add_argument("--llm", action="store_true", help="Opt-in: draft the stubs via KATA_FORGE_LLM.")
 
     survey = subcommands.add_parser("survey", help="Rank many local repos as onboarding candidates.")
     survey.add_argument("paths", nargs="+", help="Local repo paths to analyze and rank.")
@@ -152,9 +154,17 @@ def _run_extract(args: argparse.Namespace) -> int:
         except SpecError as error:
             print(f"kata-forge: error: {error}", file=sys.stderr)
             return 2
+    drafter = None
+    if args.llm:  # opt-in draft seam; a missing/unwired provider degrades to a note, never fatal
+        from kata_forge.llm import LlmUnavailable, default_drafter
+
+        try:
+            drafter = default_drafter()
+        except LlmUnavailable as error:
+            print(f"  llm: {error} (scaffolding without drafts)")
     outputs = write_extract(
         out_dir=args.out, subnet=args.subnet or None, resolved=resolved,
-        deps=report, anchors=anchors, cost=cost, spec=spec, force=args.force,
+        deps=report, anchors=anchors, cost=cost, spec=spec, drafter=drafter, force=args.force,
     )
     print(f"  wrote:  {outputs.analysis_path}")
     if outputs.scaffold_root is not None:
@@ -191,7 +201,21 @@ def main(argv: list[str] | None = None) -> int:
         print("  next: fill sample_problems / run_candidate / score / compare (see kata-sn126)")
         return 0
     if args.command == "lane-config":
-        from kata_forge.lane_config import editable_path, env_patch, lane_entry, render_snippet
+        from kata_forge.lane_config import (
+            editable_path,
+            env_patch,
+            lane_entry,
+            render_snippet,
+            secret_placeholder_block,
+        )
+
+        allowed_hosts = required_secrets = None
+        if args.repo:  # paid/networked subnet: derive the egress allowlist + secret names
+            from kata_forge.secrets import extract_secrets
+
+            secret_report = extract_secrets(args.repo)
+            allowed_hosts = secret_report.allowed_hosts
+            required_secrets = secret_report.required_secrets
 
         path = editable_path(spec, args.srv_root)
         entry = lane_entry(
@@ -199,14 +223,24 @@ def main(argv: list[str] | None = None) -> int:
             org=args.org,
             release_path=args.release_path or None,
             sample_size=args.sample_size or None,
+            allowed_hosts=allowed_hosts,
+            required_secrets=required_secrets,
         )
         print(render_snippet(spec, entry, path))
+        placeholders = secret_placeholder_block(required_secrets or [], spec.subnet_number)
+        if placeholders:
+            print("\n# 5. add these secret placeholders to the .env and fill them in:")
+            for line in placeholders:
+                print(f"     {line}")
         if args.env:
             env_file = Path(args.env).expanduser()
             if not env_file.is_file():
                 print(f"kata-forge: error: no .env at {args.env}", file=sys.stderr)
                 return 2
-            patch = env_patch(env_file.read_text(encoding="utf-8"), entry, path)
+            patch = env_patch(
+                env_file.read_text(encoding="utf-8"), entry, path,
+                secret_placeholders=required_secrets,
+            )
             if not patch:
                 print("\nkata-forge: .env already has this lane; no change needed.")
             elif args.out:

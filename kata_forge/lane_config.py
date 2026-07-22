@@ -29,14 +29,20 @@ def lane_entry(
     org: str = DEFAULT_ORG,
     release_path: str | None = None,
     sample_size: int | None = None,
+    allowed_hosts: list[str] | None = None,
+    required_secrets: list[str] | None = None,
 ) -> dict[str, Any]:
-    """The one ``KATA_LANES`` entry for this subnet."""
+    """The one ``KATA_LANES`` entry for this subnet.
+
+    For a paid/networked subnet, ``allowed_hosts`` + ``required_secrets`` add an ``egress`` block
+    documenting the proxy allowlist and the secrets the operator must supply (names only).
+    """
     challenge_config: dict[str, Any] = {}
     if release_path:
         challenge_config["pinned_release_path"] = release_path
     if sample_size:
         challenge_config["sample_size"] = int(sample_size)
-    return {
+    entry: dict[str, Any] = {
         "lane_id": spec.pack,
         "pack": spec.pack,
         "mode": spec.mode,
@@ -44,6 +50,21 @@ def lane_entry(
         "source_repos": [f"{org}/{spec.repo_name}"],
         "challenge_config": challenge_config,
     }
+    if allowed_hosts or required_secrets:
+        entry["egress"] = {
+            "allowed_hosts": sorted(allowed_hosts or []),
+            "required_secrets": sorted(required_secrets or []),
+        }
+    return entry
+
+
+def secret_placeholder_block(required_secrets: list[str], subnet_number: int) -> list[str]:
+    """Commented ``.env`` placeholder lines for the operator to fill (never a real value)."""
+    if not required_secrets:
+        return []
+    block = [f"# --- SN{subnet_number} lane secrets (fill in; do NOT commit real values) ---"]
+    block += [f"# {name}=" for name in sorted(required_secrets)]
+    return block
 
 
 def render_snippet(spec: SubnetSpec, entry: dict[str, Any], path: str) -> str:
@@ -72,8 +93,14 @@ def _split_env_value(line: str, key: str) -> str | None:
     return value
 
 
-def apply_lane_to_env(env_text: str, entry: dict[str, Any], path: str) -> str:
-    """Return ``env_text`` with the lane entry + editable path added (idempotent)."""
+def apply_lane_to_env(
+    env_text: str, entry: dict[str, Any], path: str, *, secret_placeholders: list[str] | None = None
+) -> str:
+    """Return ``env_text`` with the lane entry + editable path added (idempotent).
+
+    ``secret_placeholders`` appends commented ``# NAME=`` lines for any secret not already present,
+    so a paid subnet's keys are surfaced for the operator without ever writing a value.
+    """
     lines = env_text.splitlines()
     lanes_done = paths_done = False
     for index, line in enumerate(lines):
@@ -96,15 +123,23 @@ def apply_lane_to_env(env_text: str, entry: dict[str, Any], path: str) -> str:
         lines.append(f"{_LANES_KEY}='{json.dumps([entry], separators=(',', ':'))}'")
     if not paths_done:
         lines.append(f"{_PATHS_KEY}={path}")
+    for name in secret_placeholders or []:
+        if f"{name}=" not in env_text:  # skip secrets already set or already placeheld
+            lines.append(f"# {name}=")
     trailing = "\n" if env_text.endswith("\n") else ""
     return "\n".join(lines) + trailing
 
 
 def env_patch(
-    env_text: str, entry: dict[str, Any], path: str, *, env_path: str = "/srv/kata-bot/.env"
+    env_text: str,
+    entry: dict[str, Any],
+    path: str,
+    *,
+    env_path: str = "/srv/kata-bot/.env",
+    secret_placeholders: list[str] | None = None,
 ) -> str:
     """A unified diff adding the lane to ``env_text``; empty string if already present."""
-    modified = apply_lane_to_env(env_text, entry, path)
+    modified = apply_lane_to_env(env_text, entry, path, secret_placeholders=secret_placeholders)
     if modified == env_text:
         return ""
     rel = env_path.lstrip("/")  # git-style a/<path>, no double slash on an absolute path
