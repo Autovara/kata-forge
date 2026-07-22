@@ -62,11 +62,23 @@ def _run_extract(args: argparse.Namespace) -> int:
     except RepoResolveError as error:
         print(f"kata-forge: error: {error}", file=sys.stderr)
         return 2
+    from kata_forge.deps import classify_repo
+
     print(f"kata-forge: resolved {resolved.source}")
     print(f"  path:   {resolved.path}")
     print(f"  commit: {resolved.commit or '(not a git repo)'}")
     print(f"  cloned: {resolved.was_cloned}")
-    print("  next: dependency classification + anchor extraction (M3.2-M3.4)")
+    report = classify_repo(resolved.path)
+    print(f"  deps:   {report.verdict}")
+    for label, names in (
+        ("paid-api", report.paid_api),
+        ("gpu", report.gpu),
+        ("gated-data", report.gated_data),
+        ("unclassified", report.unclassified),
+    ):
+        if names:
+            print(f"    {label}: {', '.join(names)}")
+    print("  next: anchor extraction + report (M3.3-M3.4)")
     return 0
 
 
