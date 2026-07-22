@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from kata_forge.anchors import Anchor, AnchorReport, extract_anchors
+from kata_forge.cost import CostReport, estimate_cost
 from kata_forge.deps import DepReport, classify_repo
 from kata_forge.generator import generate
 from kata_forge.resolver import ResolvedRepo
@@ -44,6 +45,7 @@ def render_analysis(
     deps: DepReport,
     anchors: AnchorReport,
     spec: SubnetSpec | None = None,
+    cost: CostReport | None = None,
 ) -> str:
     """Render the ``<repo>-analysis.md`` code->contract map for a resolved repo."""
     title = f"kata-forge extract — subnet {subnet}" if subnet else "kata-forge extract"
@@ -68,6 +70,14 @@ def render_analysis(
     ):
         if names:
             lines.append(f"- {label}: {', '.join(names)}")
+    if cost is not None:
+        lines += ["", "## Cost verdict", f"- **{cost.summary}**"]
+        if cost.paid_providers:
+            lines.append(f"- paid providers: {', '.join(cost.paid_providers)}")
+        if cost.required_secrets:
+            lines.append(f"- required secrets: {', '.join(cost.required_secrets)}")
+        for note in cost.notes:
+            lines.append(f"- ⚠ {note}")
     lines += [
         "",
         "## Code → contract anchors",
@@ -130,18 +140,20 @@ def write_extract(
     resolved: ResolvedRepo,
     deps: DepReport | None = None,
     anchors: AnchorReport | None = None,
+    cost: CostReport | None = None,
     spec: SubnetSpec | None = None,
     force: bool = False,
 ) -> ExtractOutputs:
     """Write the analysis report (always) and, given a spec, the anchor-annotated scaffold."""
     deps = deps or classify_repo(resolved.path)
     anchors = anchors or extract_anchors(resolved.path)
+    cost = cost or estimate_cost(resolved.path, deps=deps)
     out = Path(out_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
 
     analysis_path = out / f"{resolved.path.name}-analysis.md"
     analysis_path.write_text(
-        render_analysis(subnet=subnet, resolved=resolved, deps=deps, anchors=anchors, spec=spec),
+        render_analysis(subnet=subnet, resolved=resolved, deps=deps, anchors=anchors, spec=spec, cost=cost),
         encoding="utf-8",
     )
     if spec is None:

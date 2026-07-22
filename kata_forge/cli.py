@@ -94,6 +94,7 @@ def _run_extract(args: argparse.Namespace) -> int:
         else:
             print(f"    {kind}: (not found)")
 
+    from kata_forge.cost import estimate_cost
     from kata_forge.secrets import extract_secrets
 
     secret_report = extract_secrets(resolved.path)
@@ -105,6 +106,11 @@ def _run_extract(args: argparse.Namespace) -> int:
             print(f"    hosts: {', '.join(secret_report.allowed_hosts)}")
         paid = secret_report.paid_providers
         print(f"    paid providers: {', '.join(paid) if paid else 'none (free-tier only)'}")
+
+    cost = estimate_cost(resolved.path, deps=report, secrets=secret_report)
+    print(f"  cost:   {cost.summary}")
+    for note in cost.notes:
+        print(f"    note: {note}")
 
     if not args.out:
         print("  tip: pass --out DIR to write the analysis report (+ --pack/--evaluator for a scaffold)")
@@ -125,7 +131,7 @@ def _run_extract(args: argparse.Namespace) -> int:
             return 2
     outputs = write_extract(
         out_dir=args.out, subnet=args.subnet or None, resolved=resolved,
-        deps=report, anchors=anchors, spec=spec, force=args.force,
+        deps=report, anchors=anchors, cost=cost, spec=spec, force=args.force,
     )
     print(f"  wrote:  {outputs.analysis_path}")
     if outputs.scaffold_root is not None:
