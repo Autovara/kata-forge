@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 from typing import Any
 
 from kata_forge.spec import SubnetSpec
@@ -76,8 +77,8 @@ def render_snippet(spec: SubnetSpec, entry: dict[str, Any], path: str) -> str:
             f"# 1. install:  uv pip install -e {path}",
             f"# 2. append this object to {_LANES_KEY}:",
             "     " + json.dumps(entry, separators=(",", ":")),
-            f"# 3. append to {_PATHS_KEY}:",
-            f"     :{path}",
+            f"# 3. append to {_PATHS_KEY} (comma-separated):",
+            f"     ,{path}",
             "# 4. restart the validator.",
         ]
     )
@@ -114,10 +115,16 @@ def apply_lane_to_env(
             continue
         raw_paths = _split_env_value(line, _PATHS_KEY)
         if raw_paths is not None:
-            paths = [segment for segment in raw_paths.split(":") if segment]
+            # Comma-separated to match the kata-bot consumer (orchestrator.subnet_plugin_uv_args
+            # splits on ","). A colon join looked path-like but produced one bogus --with-editable
+            # token for a second lane, breaking plugin discovery. We also split on ":" so a LEGACY
+            # colon-joined value written by the old generator is migrated to commas instead of being
+            # left as one invalid token. ":" is never a valid separator for this var (the consumer
+            # only splits on ","), and Kata plugin paths never contain ":", so this is safe.
+            paths = [segment.strip() for segment in re.split(r"[,:]", raw_paths) if segment.strip()]
             if path not in paths:
                 paths.append(path)
-            lines[index] = f"{_PATHS_KEY}={':'.join(paths)}"
+            lines[index] = f"{_PATHS_KEY}={','.join(paths)}"
             paths_done = True
     if not lanes_done:
         lines.append(f"{_LANES_KEY}='{json.dumps([entry], separators=(',', ':'))}'")

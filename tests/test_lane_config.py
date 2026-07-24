@@ -39,7 +39,41 @@ def test_apply_lane_appends_and_keeps_existing() -> None:
     lanes = json.loads(lanes_line[len("KATA_LANES=") + 1 : -1])
     assert [lane["lane_id"] for lane in lanes] == ["sn60__bitsec", "sn126__poker44"]  # kept + added
     paths_line = next(line for line in out.splitlines() if line.startswith("KATA_SUBNET_PLUGIN"))
-    assert paths_line.endswith("/srv/kata-sn60:/srv/kata-sn126")
+    assert paths_line.endswith("/srv/kata-sn60,/srv/kata-sn126")  # comma-joined, not colon
+
+
+def _consumer_split(env_line: str) -> list[str]:
+    """Reproduce kata-bot's parser exactly (orchestrator.subnet_plugin_uv_args: raw.split(',',))."""
+    raw = env_line[len("KATA_SUBNET_PLUGIN_EDITABLE_PATHS=") :]
+    return [spec.strip() for spec in raw.split(",") if spec.strip()]
+
+
+def test_two_lane_editable_paths_parse_into_two_for_the_consumer() -> None:
+    # Regression for the shipped colon/comma bug: a second lane must yield TWO --with-editable
+    # paths under the consumer's comma split, not one bogus "a:b" token.
+    out = apply_lane_to_env(SAMPLE_ENV, lane_entry(SPEC), "/srv/kata-sn126")
+    paths_line = next(line for line in out.splitlines() if line.startswith("KATA_SUBNET_PLUGIN"))
+    parsed = _consumer_split(paths_line)
+    assert parsed == ["/srv/kata-sn60", "/srv/kata-sn126"]
+    assert not any(":" in p for p in parsed)  # no colon-joined path survives
+
+
+def test_legacy_colon_value_is_migrated_to_commas() -> None:
+    # A value written by the OLD (buggy) generator is colon-joined. Adding a lane must migrate the
+    # whole value to commas, not leave the legacy part as one invalid consumer token.
+    legacy = "KATA_SUBNET_PLUGIN_EDITABLE_PATHS=/srv/a:/srv/b\n"
+    out = apply_lane_to_env(legacy, lane_entry(SPEC), "/srv/kata-sn126")
+    paths_line = next(line for line in out.splitlines() if line.startswith("KATA_SUBNET_PLUGIN"))
+    parsed = _consumer_split(paths_line)
+    assert parsed == ["/srv/a", "/srv/b", "/srv/kata-sn126"]  # legacy colon absorbed
+    assert not any(":" in p for p in parsed)
+
+
+def test_legacy_colon_value_dedupes_existing_path() -> None:
+    legacy = "KATA_SUBNET_PLUGIN_EDITABLE_PATHS=/srv/a:/srv/kata-sn126\n"
+    out = apply_lane_to_env(legacy, lane_entry(SPEC), "/srv/kata-sn126")
+    paths_line = next(line for line in out.splitlines() if line.startswith("KATA_SUBNET_PLUGIN"))
+    assert _consumer_split(paths_line) == ["/srv/a", "/srv/kata-sn126"]  # not duplicated
 
 
 def test_apply_is_idempotent() -> None:

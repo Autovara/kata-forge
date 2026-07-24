@@ -251,7 +251,7 @@ Append one entry to `KATA_LANES` (keep existing lanes) and add the plugin path t
  "source_repos":["Autovara/{{REPO}}"],
  "challenge_config":{}}
 
-KATA_SUBNET_PLUGIN_EDITABLE_PATHS=...:/srv/{{REPO}}
+KATA_SUBNET_PLUGIN_EDITABLE_PATHS=...,/srv/{{REPO}}
 ```
 
 `challenge_config` is passed straight to `sample_problems(seed, config)` — add this subnet's keys
