@@ -155,3 +155,22 @@ def test_a_splice_that_cannot_locate_the_stub_changes_nothing(plugin_tree):
     body = (plugin_tree / "kata_sn44" / "plugin.py").read_text()
     assert body == STUB_PLUGIN or "NotImplementedError" in body
     assert outcome.drafted in ([], ["no_such_method"])  # never a corrupted tree
+
+
+def test_the_verifier_isolates_by_default_and_still_rejects_bad_source(plugin_tree):
+    """Verification runs in the Draft compartment where the host allows it. Either way it must
+    reject source that does not parse -- isolation must not soften the check."""
+    (plugin_tree / "kata_sn44" / "plugin.py").write_text("def broken(:\n", encoding="utf-8")
+    ok, failure = Verifier().verify(plugin_tree)
+    assert not ok and "does not parse" in failure
+
+
+def test_the_verifier_agrees_with_itself_isolated_or_not(plugin_tree):
+    """The isolated and local paths must reach the same verdict; otherwise the fallback would be a
+    silently weaker gate."""
+    assert Verifier(isolated=True).verify(plugin_tree)[0] is True
+    assert Verifier(isolated=False).verify(plugin_tree)[0] is True
+
+    (plugin_tree / "kata_sn44" / "plugin.py").write_text("class P:\n  def x(:\n", encoding="utf-8")
+    assert Verifier(isolated=True).verify(plugin_tree)[0] is False
+    assert Verifier(isolated=False).verify(plugin_tree)[0] is False

@@ -57,18 +57,52 @@ class PinnedSource:
         return {"url": self.url, "commit": self.commit}
 
 
-def _default_git_runner(args: list[str]) -> tuple[int, str, str]:
-    """Run git with a MINIMAL environment: no operator git config, no credentials, no proxy."""
-    env = {
-        "PATH": "/usr/local/bin:/usr/bin:/bin",
-        "HOME": "/nonexistent",
-        "GIT_TERMINAL_PROMPT": "0",     # never block waiting for credentials
-        "GIT_CONFIG_NOSYSTEM": "1",     # ignore /etc/gitconfig
-        "GIT_ALLOW_PROTOCOL": "https",  # https only
-    }
+#: The minimal environment git ever sees: no operator config, no credentials, no proxy.
+_GIT_ENV = {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": "/nonexistent",
+    "GIT_TERMINAL_PROMPT": "0",     # never block waiting for credentials
+    "GIT_CONFIG_NOSYSTEM": "1",     # ignore /etc/gitconfig
+    "GIT_ALLOW_PROTOCOL": "https",  # https only
+}
+
+
+def _host_git_runner(args: list[str]) -> tuple[int, str, str]:
+    """Run git directly on the host, with a scrubbed environment.
+
+    The FALLBACK, used only where a compartment cannot be built. It keeps the credential-scrubbing
+    property but not the filesystem isolation, so ``compartment_git_runner`` is preferred.
+    """
     completed = subprocess.run(["git", *args], capture_output=True, text=True,
-                               env=env, timeout=900, check=False)
+                               env=dict(_GIT_ENV), timeout=900, check=False)
     return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+
+
+def compartment_git_runner(workspace: "Path") -> GitRunner:
+    """A git runner that executes inside the FETCH compartment (plan 7.4).
+
+    Fetch is the one compartment with egress, and it must have no credentials, no operator home and
+    no host git config — a scrubbed environment alone does not stop git reading ``~/.ssh`` or a
+    credential helper's store, because those are filesystem reachability, not environment. Inside
+    the compartment they are simply absent from the mount namespace.
+    """
+    from kata_forge.compartment import FETCH, CompartmentUnavailable, run_in_compartment
+
+    def _run(args: list[str]) -> tuple[int, str, str]:
+        try:
+            result = run_in_compartment(FETCH, ["/usr/bin/git", *args], workspace=workspace)
+        except CompartmentUnavailable:
+            # Fail closed on isolation is wrong HERE: refusing to fetch at all would block every
+            # build on a host that cannot namespace. Degrade to the scrubbed host runner and let the
+            # caller see it in the build record rather than silently believing it was isolated.
+            return _host_git_runner(args)
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+    return _run
+
+
+def _default_git_runner(args: list[str]) -> tuple[int, str, str]:
+    return _host_git_runner(args)
 
 
 def _git(runner: GitRunner, args: list[str]) -> tuple[int, str, str]:

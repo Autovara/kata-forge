@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -58,15 +59,56 @@ class DraftOutcome:
 
 
 class Verifier:
-    """Verifies one drafted plugin tree: it must lint, import, and pass its own generated tests.
+    """Verifies one drafted plugin tree: every module must parse, and ruff must be clean.
+
+    Runs in the DRAFT compartment when the host can build one. That matters because the thing being
+    verified is model output over a fetched source tree: running ruff and `compile()` on it is
+    executing a parser against attacker-influenced input, with no network and no credentials
+    available to it. Where a compartment cannot be built it falls back to running locally, which is
+    still only parsing — but the isolated path is the default.
 
     Deliberately a class so the whole verification can be swapped in a test without also swapping
     the loop's control flow — the control flow is the part being tested.
     """
 
-    def __init__(self, python: str = "python3", timeout: int = 300):
+    def __init__(self, python: str = "python3", timeout: int = 300, *, isolated: bool = True):
         self.python = python
         self.timeout = timeout
+        self.isolated = isolated
+
+    def _run_isolated(self, plugin_tree: Path) -> tuple[bool, str] | None:
+        """(ok, failure) from inside the Draft compartment, or None if it could not be built."""
+        from kata_forge.compartment import (
+            DRAFT,
+            CompartmentUnavailable,
+            fresh_workspace,
+            run_in_compartment,
+        )
+
+        script = (
+            "import pathlib, sys\n"
+            "root = pathlib.Path('plugin')\n"
+            "for py in sorted(root.rglob('*.py')):\n"
+            "    try:\n"
+            "        compile(py.read_text(), str(py), 'exec')\n"
+            "    except SyntaxError as exc:\n"
+            "        print(f'{py.name} does not parse: {exc}'); sys.exit(1)\n"
+            "print('parse-ok')\n"
+        )
+        scratch = Path(tempfile.mkdtemp(prefix="kata-forge-draft-"))
+        try:
+            scratch.chmod(0o755)
+            workspace = fresh_workspace(scratch, "verify")
+            shutil.copytree(plugin_tree, workspace / "plugin", dirs_exist_ok=True)
+            run = run_in_compartment(DRAFT, ["/usr/bin/python3", "-c", script],
+                                     workspace=workspace)
+        except (CompartmentUnavailable, OSError):
+            return None
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        if run.returncode != 0 or "parse-ok" not in run.stdout:
+            return False, (run.stdout or run.stderr).strip()[:800]
+        return True, ""
 
     def verify(self, plugin_tree: Path) -> tuple[bool, str]:
         """(ok, failure text). The failure text is fed back into the next attempt's prompt.
@@ -75,11 +117,18 @@ class Verifier:
         means a syntactically broken draft produces a precise error to feed back rather than a wall
         of lint noise about a file the linter could not read either.
         """
-        for module in sorted(plugin_tree.rglob("*.py")):
-            try:
-                compile(module.read_text(encoding="utf-8"), str(module), "exec")
-            except (OSError, SyntaxError) as exc:
-                return False, f"{module.name} does not parse: {exc}"
+        isolated = self._run_isolated(plugin_tree) if self.isolated else None
+        if isolated is not None:
+            if not isolated[0]:
+                return isolated
+        else:
+            # No compartment available (or isolation switched off): parse locally. Still only a
+            # parser over the source, never an import, so nothing from the draft executes.
+            for module in sorted(plugin_tree.rglob("*.py")):
+                try:
+                    compile(module.read_text(encoding="utf-8"), str(module), "exec")
+                except (OSError, SyntaxError) as exc:
+                    return False, f"{module.name} does not parse: {exc}"
 
         ruff = shutil.which("ruff")
         if ruff is not None:

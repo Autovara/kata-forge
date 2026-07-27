@@ -93,12 +93,34 @@ def test_every_compartment_drops_privilege_and_capabilities(tmp_path):
 
 
 def test_credential_roots_are_never_bound_into_a_compartment(tmp_path):
-    """/srv, /home, /root and /etc are ABSENT from the namespace, not merely unreadable."""
+    """/srv, /home and /root are ABSENT from every namespace, not merely unreadable.
+
+    /etc is handled separately: Fetch needs a resolver and a CA bundle or its egress is useless, so
+    it gets four NAMED files and nothing else. See the test below.
+    """
+    from kata_forge.compartment import _FETCH_NET_PATHS
+
     for compartment in COMPARTMENTS.values():
         argv = build_argv(compartment, ["/bin/true"], workspace=tmp_path)
         bound = {argv[i + 1] for i, token in enumerate(argv) if token in ("--ro-bind", "--bind")}
-        for forbidden in ("/srv", "/home", "/root", "/etc"):
+        for forbidden in ("/srv", "/home", "/root"):
             assert not any(path == forbidden or path.startswith(forbidden + "/") for path in bound)
+        etc_bound = {p for p in bound if p == "/etc" or p.startswith("/etc/")}
+        assert etc_bound <= set(_FETCH_NET_PATHS), f"{compartment.name} widened the /etc exception"
+
+
+def test_only_fetch_gets_the_resolver_and_ca_bundle(tmp_path):
+    """Draft and Verify have no network, so a resolver or CA bundle there would be pure attack
+    surface for no benefit."""
+    from kata_forge.compartment import _FETCH_NET_PATHS
+
+    for compartment in (DRAFT, VERIFY):
+        argv = build_argv(compartment, ["/bin/true"], workspace=tmp_path)
+        assert not any(path in argv for path in _FETCH_NET_PATHS)
+    fetch_argv = build_argv(FETCH, ["/bin/true"], workspace=tmp_path)
+    assert "/etc/resolv.conf" in fetch_argv and "/etc/ssl/certs" in fetch_argv
+    # Still no wholesale /etc, and still no credential file.
+    assert "/etc/shadow" not in fetch_argv and "/etc/ssh" not in fetch_argv
 
 
 def test_the_workspace_is_the_only_writable_surface(tmp_path):
@@ -323,3 +345,27 @@ def test_record_attempt_has_no_parameter_that_could_carry_a_prompt():
     parameters = set(inspect.signature(AiBudget.record_attempt).parameters)
     for forbidden in ("prompt", "text", "content", "source", "response", "output"):
         assert forbidden not in parameters
+
+
+@needs_isolation
+def test_the_fetch_compartment_still_hides_credentials_despite_its_network(tmp_path):
+    """Fetch is the one compartment with egress, so it is the one where a credential leak would
+    matter most. The /etc exception is four named files; everything else stays absent."""
+    results = cn.run_credential_canaries(tmp_path, compartments=[FETCH])
+    cn.assert_all_canaries_blocked(results)
+
+
+@needs_isolation
+def test_git_runs_inside_the_fetch_compartment(tmp_path):
+    """The runner must actually execute in the namespace, not fall through to the host."""
+    from kata_forge.compartment import SANDBOX_UID
+    from kata_forge.pinned_fetch import compartment_git_runner
+
+    workspace = fresh_workspace(tmp_path, "gitns")
+    runner = compartment_git_runner(workspace)
+    code, out, _ = runner(["--version"])
+    assert code == 0 and out.startswith("git version")
+
+    # And the surrounding compartment is genuinely unprivileged.
+    run = run_in_compartment(FETCH, ["/usr/bin/id", "-u"], workspace=workspace)
+    assert run.stdout.strip() == str(SANDBOX_UID)

@@ -82,17 +82,35 @@ def build_parser() -> argparse.ArgumentParser:
     build_cmd.add_argument("--commit", default=None, help="Pin at this full 40-character sha.")
     build_cmd.add_argument("--out", default=None,
                            help=f"Output root (or ${build_output_root_env()}); absolute, mode 0700.")
-    build_cmd.add_argument("--pack", required=True, help="Lane pack, e.g. sn44__poker44.")
-    build_cmd.add_argument("--evaluator", required=True, help="Evaluator id, e.g. sn44_poker44.")
+    build_cmd.add_argument("--pack", default=None,
+                           help="Lane pack (default: derived from --subnet and the repo name).")
+    build_cmd.add_argument("--evaluator", default=None,
+                           help="Evaluator id (default: derived from the pack).")
     build_cmd.add_argument("--mode", default="miner", help="Submission mode (default: miner).")
     build_cmd.add_argument("--name", default="", help="Display slug (default: derived from --pack).")
-    build_cmd.add_argument("--kata-rev", required=True, help="Pinned kata revision.")
-    build_cmd.add_argument("--kata-bot-rev", required=True, help="Pinned kata-bot revision.")
-    build_cmd.add_argument("--kata-forge-rev", required=True, help="Pinned kata-forge revision.")
-    build_cmd.add_argument("--kata-tree-hash", required=True,
-                           help="Content hash of the installed kata core this bundle targets.")
+    # Revisions and the core hash are READ FROM THE CHECKOUTS by default. Requiring an operator
+    # to paste four hashes correctly is how a bundle ends up pinned to the wrong core.
+    build_cmd.add_argument("--kata-root", default=None,
+                           help="Path to the kata checkout (default: sibling of this repo).")
+    build_cmd.add_argument("--kata-bot-root", default=None,
+                           help="Path to the kata-bot checkout (default: sibling).")
+    build_cmd.add_argument("--kata-rev", default=None, help="Override the detected kata revision.")
+    build_cmd.add_argument("--kata-bot-rev", default=None, help="Override the detected revision.")
+    build_cmd.add_argument("--kata-forge-rev", default=None, help="Override the detected revision.")
+    build_cmd.add_argument("--kata-tree-hash", default=None,
+                           help="Override the computed kata core content hash.")
     build_cmd.add_argument("--new-attempt", action="store_true",
                            help="Change the attempt nonce, producing a different build id.")
+    build_cmd.add_argument("--source-repo", default="Autovara/kata",
+                           help="The Kata repo whose PRs route to this lane.")
+    build_cmd.add_argument("--plugin-src", default=None,
+                           help="A COMPLETED plugin tree to package instead of scaffolding one.")
+    build_cmd.add_argument("--vendor-closure-files", type=int, default=None,
+                           help="Measured scorer closure size (VENDOR evidence).")
+    build_cmd.add_argument("--vendor-entangled", default="",
+                           help="Comma-separated entanglements, e.g. docker,bittensor.")
+    build_cmd.add_argument("--parity-json", default=None,
+                           help="Path to an executed parity fixture result (CLONE evidence).")
     build_cmd.add_argument("--allow-gpu", action="store_true",
                            help="Explicitly permit a GPU-requiring validator.")
 
@@ -222,42 +240,115 @@ def build_output_root_env() -> str:
     return OUTPUT_ROOT_ENV
 
 
+def _git_rev(path: Path) -> str:
+    """The checkout's HEAD, or "unknown". Read, never asked for: pasting four hashes by hand is how
+    a bundle ends up pinned to a core it was not built against."""
+    import subprocess
+
+    try:
+        result = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                                capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return result.stdout.strip() or "unknown"
+
+
+def _derive_spec(args: argparse.Namespace):
+    """Fill in pack/evaluator/subnet from whatever the operator did supply."""
+    from kata_forge.spec import SubnetSpec
+    from kata_forge.trusted_input import parse_canonical_github_url
+
+    subnet = args.subnet
+    pack, evaluator = args.pack, args.evaluator
+    if pack:
+        subnet = subnet or _subnet_from_pack(pack)
+    if subnet is None:
+        raise ValueError("pass --subnet, or a --pack of the form sn<N>__<slug>")
+    if not pack:
+        slug = (parse_canonical_github_url(args.repo).repo.lower().replace("-", "_")
+                if args.repo else f"sn{subnet}")
+        pack = f"sn{subnet}__{slug}"
+    if not evaluator:
+        evaluator = pack.replace("__", "_")
+    return SubnetSpec(subnet_number=subnet, pack=pack, evaluator_id=evaluator,
+                      mode=args.mode, name=args.name)
+
+
 def _handle_build(args: argparse.Namespace) -> int:
-    """Run the S7 chain. Exit 0 for a verified bundle, 2 for a refusal or a rejected input."""
+    """Run the S7 chain. Exit 0 for an installable bundle, 2 for a refusal or a rejected input."""
+    import json
     import os
 
     from kata_forge.build import OUTPUT_ROOT_ENV, BuildError, build
     from kata_forge.pinned_fetch import PinnedFetchError
-    from kata_forge.spec import SubnetSpec
     from kata_forge.trusted_input import TrustedInputError
 
     output_root = args.out or os.environ.get(OUTPUT_ROOT_ENV)
     if not output_root:
         print(f"kata-forge: error: pass --out or set {OUTPUT_ROOT_ENV}", file=sys.stderr)
         return 2
+
+    here = Path(__file__).resolve().parents[2]
+    kata_root = Path(args.kata_root) if args.kata_root else here / "kata"
+    kata_bot_root = Path(args.kata_bot_root) if args.kata_bot_root else here / "kata-bot"
+
     try:
-        spec = SubnetSpec(subnet_number=args.subnet or _subnet_from_pack(args.pack),
-                          pack=args.pack, evaluator_id=args.evaluator, mode=args.mode,
-                          name=args.name)
+        spec = _derive_spec(args)
+        kata_tree_hash = args.kata_tree_hash or _kata_tree_hash(kata_root)
+        parity = json.loads(Path(args.parity_json).read_text()) if args.parity_json else None
         result = build(
-            output_root=output_root, spec=spec, repo=args.repo, subnet=args.subnet,
+            output_root=output_root, spec=spec, repo=args.repo,
+            # --subnet also names the lane. When --repo resolves the input, the number is
+            # spec-only; passing it as a resolver input too would trip the mutual exclusion.
+            subnet=None if args.repo else args.subnet,
             catalog_path=args.catalog, commit=args.commit, new_attempt=args.new_attempt,
-            allow_gpu=args.allow_gpu, kata_rev=args.kata_rev, kata_bot_rev=args.kata_bot_rev,
-            kata_forge_rev=args.kata_forge_rev, kata_tree_hash=args.kata_tree_hash,
+            allow_gpu=args.allow_gpu,
+            kata_rev=args.kata_rev or _git_rev(kata_root),
+            kata_bot_rev=args.kata_bot_rev or _git_rev(kata_bot_root),
+            kata_forge_rev=args.kata_forge_rev or _git_rev(Path(__file__).resolve().parents[1]),
+            kata_tree_hash=kata_tree_hash,
+            source_repo=args.source_repo,
+            plugin_source=args.plugin_src,
+            vendor_closure_files=args.vendor_closure_files,
+            vendor_entangled=[v for v in args.vendor_entangled.split(",") if v.strip()],
+            parity=parity,
         )
-    except (TrustedInputError, PinnedFetchError, BuildError) as error:
+    except (TrustedInputError, PinnedFetchError, BuildError, ValueError, OSError) as error:
         print(f"kata-forge: REFUSE / NEEDS-HUMAN: {error}", file=sys.stderr)
         return 2
 
     print(f"kata-forge: {result.state} {result.build_id}")
+    print(f"  mode:   {result.mode}")
     print(f"  bundle: {result.bundle_dir}")
     if result.reused:
         print("  (existing build for identical inputs; pass --new-attempt to rebuild)")
-    if result.reason:
-        print(f"  reason: {result.reason}")
+    if result.unresolved_methods:
+        print(f"  UNRESOLVED: {', '.join(result.unresolved_methods)}")
+        print("  reviewable, but the installer will refuse it until these are written")
     if result.installable:
         print(f"  next: sudo kata-subnets stage --bundle {result.bundle_dir}")
     return 0 if result.installable else 2
+
+
+def _kata_tree_hash(kata_root: Path) -> str:
+    """The installed core's content hash, computed the same way the installer computes it."""
+    import hashlib
+
+    base = kata_root / "kata"
+    if not base.is_dir():
+        raise ValueError(f"no kata core at {base}; pass --kata-root or --kata-tree-hash")
+    entries = []
+    for path in sorted(base.rglob("*")):
+        if path.is_file() and not path.is_symlink():
+            entries.append((str(path.relative_to(base)).replace("\\", "/"),
+                            hashlib.sha256(path.read_bytes()).hexdigest()))
+    digest = hashlib.sha256()
+    for rel, file_hash in sorted(entries):
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_hash.encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def _subnet_from_pack(pack: str) -> int:

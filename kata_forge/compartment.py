@@ -81,9 +81,16 @@ class Compartment:
     notes: tuple[str, ...] = field(default_factory=tuple)
 
 
+#: The ONLY /etc files any compartment sees, and only Fetch sees them: a resolver and a CA bundle.
+#: Egress is useless without DNS and TLS trust, but binding /etc wholesale would hand over
+#: /etc/shadow, ssh host keys and every credential file there. These four are named individually so
+#: the exception cannot widen by accident.
+_FETCH_NET_PATHS = ("/etc/resolv.conf", "/etc/ssl/certs", "/etc/hosts", "/etc/nsswitch.conf")
+
 FETCH = Compartment(
     name="fetch",
     network=True,  # the ONLY compartment with egress, and only for HTTPS to GitHub
+    ro_paths=_FETCH_NET_PATHS,
     max_wall_seconds=900,
     notes=("git only; no project hooks or submodules; no credentials, home, or host git config",),
 )
@@ -145,10 +152,15 @@ def build_argv(
     command += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
 
     for path in (*compartment.ro_paths, *ro_extra):
-        resolved = Path(path).expanduser().resolve()
+        declared = Path(path).expanduser()
+        resolved = declared.resolve()
         if not resolved.exists():
-            raise CompartmentError(f"read-only input does not exist: {resolved}")
-        command += ["--ro-bind", str(resolved), str(resolved)]
+            raise CompartmentError(f"read-only input does not exist: {declared}")
+        # Bind the RESOLVED file at its DECLARED path. On Ubuntu /etc/resolv.conf is a symlink into
+        # /run/systemd/resolve; binding the target at its own location would leave /etc/resolv.conf
+        # absent inside, and DNS would fail with a confusing "could not resolve host" instead of a
+        # missing-mount error.
+        command += ["--ro-bind", str(resolved), str(declared)]
 
     command += [
         "--bind", str(work), str(work),   # the single writable surface

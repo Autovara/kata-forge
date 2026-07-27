@@ -39,7 +39,7 @@ from kata_forge.onboard import INTEGRATION_DECISION_FILENAME
 from kata_forge.cost import estimate_cost
 from kata_forge.deps import classify_repo
 from kata_forge.license_gate import detect_license
-from kata_forge.pinned_fetch import fetch_pinned
+from kata_forge.pinned_fetch import compartment_git_runner, fetch_pinned
 from kata_forge.redaction import scan_embedded_secrets
 from kata_forge.trusted_input import (
     CanonicalRepo,
@@ -500,11 +500,20 @@ def build(
     # build id exists; a retry therefore re-resolves but does not re-emit.
     canonical: CanonicalRepo = resolve_trusted_input(repo=repo, subnet=subnet,
                                                      catalog_path=catalog_path)
-    fetch_root = root / ".sources"
+    # FETCH runs in the Fetch compartment: the one compartment with egress, and the one that must
+    # never see a credential, the operator's home, or host git config. A caller-supplied runner
+    # (tests) wins, so this adds isolation without taking away injectability.
+    # The clone target must be WRITABLE BY THE SANDBOX UID: inside the compartment the workload is
+    # uid 65534 and the workspace is its only writable surface, so `fresh_workspace` (which sets the
+    # mode and makes the ancestors searchable) is required here -- a plain mkdtemp is not enough.
+    fetch_scratch = fresh_workspace(_compartment_scratch(), "fetch")
+    fetch_root = fetch_scratch / "sources"
     fetch_root.mkdir(parents=True, exist_ok=True)
+    fetch_root.chmod(0o777)
     source_dir = fetch_root / f"{canonical.owner}__{canonical.repo}"
     shutil.rmtree(source_dir, ignore_errors=True)
-    pinned = fetch_pinned(canonical, source_dir, commit=commit, git_runner=git_runner)
+    runner = git_runner or compartment_git_runner(fetch_scratch)
+    pinned = fetch_pinned(canonical, source_dir, commit=commit, git_runner=runner)
 
     inputs = BuildInputs(
         source_url=pinned.url,
