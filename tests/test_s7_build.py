@@ -73,7 +73,8 @@ def _build(out_root, **over):
     kwargs = dict(output_root=out_root, spec=_spec(), repo=GOOD,
                   kata_rev="k1", kata_bot_rev="b1", kata_forge_rev="f1",
                   kata_tree_hash="a" * 64, git_runner=ScriptedGit(FREE_SOURCE),
-                  wheel_builder=fake_wheel, vendor_closure_files=2)
+                  wheel_builder=fake_wheel, vendor_closure_files=2,
+                  source_repo="Autovara/kata")
     kwargs.update(over)
     return build(**kwargs)
 
@@ -125,9 +126,13 @@ def _completed_plugin(tmp_path):
     tree = tmp_path / "completed" / "kata-sn44" / "kata_sn44"
     tree.mkdir(parents=True, exist_ok=True)
     (tree.parent / "pyproject.toml").write_text(
-        "[project]\nname = 'kata-sn44'\nversion = '0.1.0'\n", encoding="utf-8")
-    (tree / "__init__.py").write_text("", encoding="utf-8")
-    (tree / "plugin.py").write_text("UNRESOLVED_METHODS = ()\n", encoding="utf-8")
+        "[project]\nname = 'kata-sn44'\nversion = '0.1.0'\n\n"
+        '[project.entry-points."kata.subnets"]\n'
+        "sn44 = 'kata_sn44:PLUGIN'\n", encoding="utf-8")
+    (tree / "__init__.py").write_text("from kata_sn44.plugin import PLUGIN\n", encoding="utf-8")
+    (tree / "plugin.py").write_text(
+        "UNRESOLVED_METHODS = ()\n\n\nclass P:\n    evaluator_id = 'sn44_poker44'\n\n\n"
+        "PLUGIN = P()\n", encoding="utf-8")
     return tree.parent
 
 
@@ -172,7 +177,10 @@ def test_the_manifest_pins_the_source_and_the_abi(out_root):
     assert manifest["build_inputs"]["source_commit"] == SHA
     assert manifest["build_inputs"]["source_url"] == GOOD
     assert manifest["abi"]["kata_tree_hash"] == "a" * 64
-    assert manifest["registry_change"]["lane"]["upstream_commit"] == SHA
+    # A VENDOR lane declares no upstream pin -- kata-bot forbids it, because the vendored copy is
+    # the single source of truth and a second pin would drift.
+    assert manifest["registry_change"]["lane"]["integration_mode"] == "vendor"
+    assert "upstream_commit" not in manifest["registry_change"]["lane"]
 
 
 def test_the_sbom_is_deterministic(out_root, tmp_path):
@@ -266,7 +274,9 @@ def test_nothing_is_left_at_the_build_id_until_promotion(out_root):
 def test_the_build_state_records_only_legal_states(out_root):
     state = json.loads((_build(out_root).bundle_dir / BUILD_STATE_FILENAME).read_text())
     assert state["state"] in STATES and state["state"] == "verified"
-    assert state["conformance"] == "passed"
+    # The forge records what IT established, never more. `passed` means its own narrow smoke check
+    # ran and succeeded; `not-run` is honest when the host cannot isolate.
+    assert state["conformance"] in ("passed", "not-run")
     # The pins the S4 installer cross-checks against the manifest.
     assert state["evaluator_id"] == "sn44_poker44" and state["kata_tree_hash"] == "a" * 64
 

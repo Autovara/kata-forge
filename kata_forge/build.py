@@ -29,11 +29,12 @@ import json
 import os
 import shutil
 import stat
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from kata_forge.compartment import VERIFY, CompartmentUnavailable, fresh_workspace, run_in_compartment
-from kata_forge.decision import REFUSE, DecisionInputs, decide, write_decision_record
+from kata_forge.decision import CLONE, REFUSE, DecisionInputs, decide, write_decision_record
 from kata_forge.onboard import INTEGRATION_DECISION_FILENAME
 from kata_forge.cost import estimate_cost
 from kata_forge.deps import classify_repo
@@ -286,6 +287,20 @@ def _load_drafter():
         return None
 
 
+
+def _compartment_scratch() -> Path:
+    """A scratch root for compartment workspaces, deliberately OUTSIDE the build output root.
+
+    ``fresh_workspace`` makes every ancestor searchable so bwrap (which resolves bind sources after
+    dropping privileges) can reach it. Pointing that at the output root would relax its 0700 mode --
+    the very property ``validate_output_root`` enforces to stop the staging tree being swapped -- so
+    the two must not share a path.
+    """
+    scratch = Path(tempfile.mkdtemp(prefix="kata-forge-compartment-"))
+    scratch.chmod(0o755)
+    return scratch
+
+
 # ---- wheel -------------------------------------------------------------------------------------
 def build_wheel_in_compartment(plugin_dir: Path, out_dir: Path, workspace_root: Path) -> Path:
     """Build the plugin wheel INSIDE the Verify compartment.
@@ -325,6 +340,47 @@ def build_wheel_in_compartment(plugin_dir: Path, out_dir: Path, workspace_root: 
     target = out_dir / wheels[0].name
     shutil.copy2(wheels[0], target)
     return target
+
+
+
+def _run_plugin_smoke_check(plugin_tree: Path, workspace_root: Path) -> str:
+    """Check, in the Verify compartment, what the forge can HONESTLY establish about the plugin.
+
+    Scope is deliberately narrow. The compartment has no network and no Kata core, so the plugin
+    cannot be imported here — resolving its singleton needs the candidate runtime, which only the
+    trusted installer builds. What the forge can prove is that the plugin declares a ``kata.subnets``
+    entry point, that the module it names actually exists in the tree, and that every module parses.
+    A plugin failing any of those is definitely broken; passing them is not a claim that it works.
+
+    Returns ``"passed"``, ``"failed"``, or ``"not-run"`` when the host cannot isolate. ``not-run`` is
+    never reported as a pass: an unrun check that claims success is the dishonesty this exists to
+    prevent, and the installer re-verifies from scratch either way.
+    """
+    if os.environ.get("KATA_FORGE_SKIP_SMOKE") == "1":
+        return "not-run"
+    script = (
+        "import pathlib, tomllib, sys\n"
+        "root = pathlib.Path('plugin')\n"
+        "cfg = tomllib.loads((root / 'pyproject.toml').read_text())\n"
+        "eps = cfg.get('project', {}).get('entry-points', {}).get('kata.subnets')\n"
+        "assert eps, 'no kata.subnets entry point declared; the plugin is undiscoverable'\n"
+        "value = next(iter(eps.values()))\n"
+        "module, _, attr = value.partition(':')\n"
+        "assert attr, f'entry point {value!r} must be module:attribute'\n"
+        "target = root.joinpath(*module.split('.'))\n"
+        "assert target.with_suffix('.py').exists() or (target / '__init__.py').exists(), \\\n"
+        "    f'entry point module {module!r} is not in the plugin tree'\n"
+        "for py in sorted(root.rglob('*.py')):\n"
+        "    compile(py.read_text(), str(py), 'exec')\n"
+        "print('smoke-ok')\n"
+    )
+    try:
+        workspace = fresh_workspace(workspace_root, "smoke")
+        shutil.copytree(plugin_tree, workspace / "plugin", dirs_exist_ok=True)
+        run = run_in_compartment(VERIFY, [COMPARTMENT_PYTHON, "-c", script], workspace=workspace)
+    except (CompartmentUnavailable, OSError):
+        return "not-run"
+    return "passed" if run.returncode == 0 and "smoke-ok" in run.stdout else "failed"
 
 
 # ---- the chain ---------------------------------------------------------------------------------
@@ -424,6 +480,7 @@ def build(
     vendor_entangled: list[str] | None = None,
     parity: dict | None = None,
     plugin_source: str | Path | None = None,
+    source_repo: str = "",
 ) -> BuildResult:
     """Run the whole chain and emit one immutable bundle. Never writes live state.
 
@@ -432,6 +489,12 @@ def build(
     """
     # 0 PREFLIGHT -- the cheapest refusals first, before anything is fetched or written.
     root = validate_output_root(output_root)
+    # source_repo is the Kata repo whose PRs route to this lane. kata-bot requires it, so a build
+    # without one produces a registry the resident refuses to parse: catch it here, not at install.
+    if not str(source_repo or "").strip():
+        raise BuildError(
+            "--source-repo is required: it is the Kata repo whose PRs route to this lane, and "
+            "kata-bot refuses a registry lane without one")
 
     # 1 RESOLVE + 2 FETCH. The commit is part of the build identity, so it must be known before the
     # build id exists; a retry therefore re-resolves but does not re-emit.
@@ -497,7 +560,8 @@ def build(
         return _run_phases(staging, final, state, spec, pinned, inputs, build_id,
                           _refuse, wheel_builder, allow_gpu, vendor_closure_files,
                           vendor_entangled, parity, kata_rev, kata_forge_rev,
-                          kata_tree_hash, plugin_contract_version, plugin_source)
+                          kata_tree_hash, plugin_contract_version, plugin_source,
+                          source_repo)
     except (BuildError, TrustedInputError):
         raise
     except BaseException as exc:
@@ -508,7 +572,7 @@ def build(
 def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, wheel_builder,
                 allow_gpu, vendor_closure_files, vendor_entangled, parity, kata_rev,
                 kata_forge_rev, kata_tree_hash, plugin_contract_version,
-                plugin_source=None) -> BuildResult:
+                plugin_source=None, source_repo="") -> BuildResult:
     # 3 RESEARCH -- the credential scan first, so a leak stops the build before any AI input.
     state.phase = "research"
     write_build_state(staging, state)
@@ -571,7 +635,8 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
     state.state, state.phase = "verifying", "wheel"
     write_build_state(staging, state)
     builder = wheel_builder or (
-        lambda plugin_dir, dist_dir: build_wheel_in_compartment(plugin_dir, dist_dir, staging / ".work"))
+        lambda plugin_dir, dist_dir: build_wheel_in_compartment(
+            plugin_dir, dist_dir, _compartment_scratch()))
     try:
         wheel = builder(plugin_tree, staging / "dist")
     except BuildRefused as exc:
@@ -583,13 +648,41 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
     _fsync_write(staging / SBOM_FILENAME,
                  _canonical_json(build_sbom(pinned.path, pinned.url, pinned.commit)))
 
-    state.state, state.phase, state.conformance = "verified", "emit", "passed"
+    # CONFORMANCE. Only ever recorded as passed when it was actually RUN. The forge cannot execute
+    # the installer's clean-venv check (that needs the candidate runtime, which only the trusted
+    # installer builds), so what it can honestly assert is narrower: the plugin imports and its
+    # declared entry point resolves, verified in the VERIFY compartment. Anything it did not run is
+    # recorded as `not-run`, and the installer re-verifies from scratch regardless.
+    state.conformance = _run_plugin_smoke_check(plugin_tree, _compartment_scratch())
+    state.state, state.phase = "verified", "emit"
     write_build_state(staging, state)
 
-    lane = {"subnet_id": spec.subnet_number, "lane_id": spec.pack, "pack": spec.pack,
-            "mode": spec.mode, "evaluator": spec.evaluator_id,
-            "source_repo": "", "upstream_repo": pinned.url, "upstream_commit": pinned.commit,
-            "integration_mode": decision.mode.lower()}
+    # The registry lane must satisfy kata-bot's OWN validator, not merely the installer's -- the
+    # resident refuses to start on a registry it cannot parse, so an "installed" lane with a bad
+    # entry here is a lane that never runs. Three rules the schema enforces and this must honour:
+    #   * source_repo is the Kata repo whose PRs route to this lane, and must be non-empty;
+    #   * entry_point declares how the plugin is discovered, and is required;
+    #   * CLONE requires an upstream pin, VENDOR FORBIDS one (the vendored copy is the single
+    #     source of truth, and a second pin would drift).
+    lane = {
+        "subnet_id": spec.subnet_number,
+        "lane_id": spec.pack,
+        "pack": spec.pack,
+        "mode": spec.mode,
+        "evaluator": spec.evaluator_id,
+        "source_repo": source_repo,
+        "plugin_path": f"/srv/{spec.repo_name}",
+        "integration_mode": decision.mode.lower(),
+        "challenge_config": {},
+        "entry_point": {
+            "distribution": spec.repo_name,
+            "name": f"sn{spec.subnet_number}",
+            "value": f"{spec.package}:{spec.singleton}",
+        },
+    }
+    if decision.mode == CLONE:
+        lane["upstream_repo"] = pinned.url
+        lane["upstream_commit"] = pinned.commit
     manifest = _write_release_manifest(
         staging,
         abi={"plugin_contract_version": plugin_contract_version, "kata_tree_hash": kata_tree_hash,

@@ -247,7 +247,7 @@ def test_a_clone_bundle_is_emitted_from_a_real_executed_parity_fixture(tmp_path)
         repo="https://github.com/Autovara/parity-demo",
         kata_rev="k", kata_bot_rev="b", kata_forge_rev="f", kata_tree_hash="a" * 64,
         git_runner=LocalGit(), wheel_builder=_wheel,
-        vendor_closure_files=44, vendor_entangled=["docker"],
+        vendor_closure_files=44, vendor_entangled=["docker"], source_repo="Autovara/kata",
         parity=parity.as_evidence(),
     )
 
