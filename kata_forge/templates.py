@@ -33,8 +33,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["{{PACKAGE}}"]
 
-[tool.uv.sources]
-kata = { path = "../kata", editable = true }
+# NOTE: deliberately no [tool.uv.sources] pinning `kata` to "../kata". That only resolves in a dev
+# checkout laid out beside the core, and it silently breaks everywhere the plugin is actually used:
+# inside a release bundle, inside the Verify compartment, and inside the candidate runtime, where
+# `kata` comes from the verified base wheel rather than a sibling directory. For local development,
+# install the core into your venv (`uv pip install -e ../kata`) instead of pinning it here.
 
 [tool.ruff]
 line-length = 100
@@ -124,6 +127,17 @@ EVALUATOR_ID = "{{EVALUATOR}}"
 LANE_PACK = "{{PACK}}"
 VALIDATOR_IDENTITY = "{{SLUG}}-v1"
 
+#: Methods still to be written for this subnet. The build reads this list rather than guessing, and
+#: the trusted installer REFUSES a bundle whose list is non-empty -- an honest UNRESOLVED build is
+#: reviewable, but it must never become a half-working deployment. Delete a name once its body and
+#: its tests are real.
+UNRESOLVED_METHODS = (
+    "sample_problems",
+    "benchmark_identity",
+    "run_candidate",
+    "score",
+)
+
 
 class {{CLASS}}(SubnetPlugin):
     """SN{{N}} {{DISPLAY}} plugin."""
@@ -156,11 +170,26 @@ class {{CLASS}}(SubnetPlugin):
     def score(self, raw: {{BASE}}RawRun, problems: {{BASE}}Problems) -> ScoreCard:
         raise NotImplementedError("TODO score() for {{DISPLAY}} -- see kata-sn126.")
 
+    # compare() and beats_king() below are NOT stubs. They are generic over the ScoreCard contract
+    # -- ranking by `comparable` and clearing the king by `beats_threshold` needs no subnet
+    # knowledge -- so the scaffold ships working implementations. Override only if this subnet
+    # ranks on something the single `comparable` scalar cannot express.
+
     def compare(self, a: ScoreCard, b: ScoreCard) -> int:
-        raise NotImplementedError("TODO compare() for {{DISPLAY}} -- see kata-sn126.")
+        # A failed run must never rank above a valid one (see ScoreCard.passed); after that, the
+        # higher `comparable` wins.
+        if a.passed != b.passed:
+            return 1 if a.passed else -1
+        return (a.comparable > b.comparable) - (a.comparable < b.comparable)
 
     def beats_king(self, candidate: ScoreCard, king: ScoreCard | None) -> bool:
-        raise NotImplementedError("TODO beats_king() for {{DISPLAY}} -- see kata-sn126.")
+        # A challenger must be a valid run, and must clear the king by its own declared margin
+        # (`beats_threshold`; 0.0 means strict greater-than). No king yet == any valid run wins.
+        if not candidate.passed:
+            return False
+        if king is None:
+            return True
+        return candidate.comparable > king.comparable + candidate.beats_threshold
 '''
 
 _TEST_PLUGIN = '''\

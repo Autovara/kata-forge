@@ -120,8 +120,32 @@ def test_the_build_id_covers_every_pinned_revision():
 
 
 # ---- the happy path --------------------------------------------------------------------------
-def test_a_free_permissive_repo_emits_a_verified_bundle(out_root):
+def _completed_plugin(tmp_path):
+    """A plugin with every subnet-specific method written, as a human would finish it."""
+    tree = tmp_path / "completed" / "kata-sn44" / "kata_sn44"
+    tree.mkdir(parents=True, exist_ok=True)
+    (tree.parent / "pyproject.toml").write_text(
+        "[project]\nname = 'kata-sn44'\nversion = '0.1.0'\n", encoding="utf-8")
+    (tree / "__init__.py").write_text("", encoding="utf-8")
+    (tree / "plugin.py").write_text("UNRESOLVED_METHODS = ()\n", encoding="utf-8")
+    return tree.parent
+
+
+def test_a_scaffolded_build_is_verified_but_not_installable(out_root):
+    """A scaffold's subnet-specific methods are unwritten. The build still completes and is
+    reviewable -- that is an honest UNRESOLVED outcome -- but it must never be installable."""
     result = _build(out_root)
+
+    assert result.state == "verified" and result.mode == VENDOR
+    assert not result.installable
+    assert result.unresolved_methods == ["benchmark_identity", "run_candidate",
+                                         "sample_problems", "score"]
+    state = json.loads((result.bundle_dir / BUILD_STATE_FILENAME).read_text())
+    assert state["unresolved_methods"] == result.unresolved_methods
+
+
+def test_a_completed_plugin_emits_an_installable_bundle(out_root, tmp_path):
+    result = _build(out_root, plugin_source=_completed_plugin(tmp_path))
 
     assert result.state == "verified" and result.mode == VENDOR and result.installable
     bundle = result.bundle_dir

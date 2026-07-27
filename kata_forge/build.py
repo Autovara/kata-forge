@@ -29,7 +29,6 @@ import json
 import os
 import shutil
 import stat
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,6 +51,13 @@ BUILD_STATE_FILENAME = "build-state.json"
 MANIFEST_FILENAME = "release-manifest.json"
 SBOM_FILENAME = "sbom.json"
 OUTPUT_ROOT_ENV = "KATA_FORGE_OUTPUT_ROOT"
+#: The interpreter that exists INSIDE a compartment (only /usr, /bin, /lib are bound).
+COMPARTMENT_PYTHON = "/usr/bin/python3"
+#: A PINNED, OFFLINE build-tools environment (hatchling/setuptools/wheel), bound READ-ONLY into the
+#: Verify compartment. Every real Kata plugin builds with hatchling, which the system python does not
+#: ship -- and the compartment has no network, by design, so it cannot fetch one. Providing the
+#: toolchain as a read-only fixture is what plan 7.4 means by "fixtures read-only".
+BUILD_TOOLS_ENV = os.environ.get("KATA_FORGE_BUILD_TOOLS", "/opt/kata-forge/build-tools")
 
 #: The only states a build may record (plan 4.2). Anything else is a bug, not a new state.
 STATES = ("researching", "drafting", "verifying", "verified", "refused", "failed")
@@ -139,6 +145,9 @@ class BuildState:
     evaluator_id: str = ""
     kata_tree_hash: str = ""
     conformance: str = "not-run"
+    #: Methods still unwritten. A non-empty list is an honest UNRESOLVED build: emitted
+    #: for review, but refused by the trusted installer.
+    unresolved_methods: list = None
 
     def as_document(self) -> dict:
         if self.state not in STATES:
@@ -153,6 +162,7 @@ class BuildState:
             "evaluator_id": self.evaluator_id,
             "kata_tree_hash": self.kata_tree_hash,
             "conformance": self.conformance,
+            "unresolved_methods": sorted(self.unresolved_methods or []),
         }
 
 
@@ -205,6 +215,34 @@ def build_sbom(source_root: Path, pinned_url: str, pinned_commit: str) -> dict:
     }
 
 
+
+def read_unresolved_methods(plugin_tree: Path) -> list[str]:
+    """The methods a scaffolded plugin still declares as unwritten.
+
+    Parsed from the source with ast, never imported: importing generated plugin code inside the
+    build process is precisely what the Draft/Verify compartments exist to prevent.
+    """
+    import ast
+
+    for module in sorted(plugin_tree.rglob("plugin.py")):
+        try:
+            tree = ast.parse(module.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if "UNRESOLVED_METHODS" not in names:
+                continue
+            try:
+                value = ast.literal_eval(node.value)
+            except ValueError:
+                return []
+            return sorted(str(item) for item in value)
+    return []
+
+
 # ---- wheel -------------------------------------------------------------------------------------
 def build_wheel_in_compartment(plugin_dir: Path, out_dir: Path, workspace_root: Path) -> Path:
     """Build the plugin wheel INSIDE the Verify compartment.
@@ -213,14 +251,24 @@ def build_wheel_in_compartment(plugin_dir: Path, out_dir: Path, workspace_root: 
     plugin, so it runs unprivileged, with no network and no credentials — never on the build host
     directly. If the host cannot isolate, the build REFUSES rather than building it unconfined.
     """
+    tools = Path(BUILD_TOOLS_ENV)
+    tools_python = tools / "bin" / "python"
+    if not tools_python.is_file():
+        raise BuildRefused(
+            f"no build-tools environment at {tools} (set KATA_FORGE_BUILD_TOOLS). The Verify "
+            f"compartment has no network by design, so the build backend must be provided as a "
+            f"read-only fixture; refusing rather than building unconfined.")
     workspace = fresh_workspace(workspace_root, "wheel")
     shutil.copytree(plugin_dir, workspace / "plugin", dirs_exist_ok=True)
     try:
         run = run_in_compartment(
             VERIFY,
-            [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
+            # The SANDBOX's python, not sys.executable: the caller's venv is deliberately not
+            # bound into the compartment, so its interpreter does not exist inside.
+            [str(tools_python), "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
              "-w", str(workspace / "dist"), str(workspace / "plugin")],
             workspace=workspace,
+            ro_extra=(str(tools),),
         )
     except CompartmentUnavailable as exc:
         raise BuildRefused(
@@ -246,11 +294,13 @@ class BuildResult:
     reason: str = ""
     reused: bool = False
     artifacts: list[str] = field(default_factory=list)
+    unresolved_methods: list[str] = field(default_factory=list)
 
     @property
     def installable(self) -> bool:
-        """Only a bundle that reached ``verified`` may be staged."""
-        return self.state == "verified"
+        """Only a bundle that reached ``verified`` with NO unwritten method may be staged. An
+        UNRESOLVED build is a legitimate, reviewable output -- it is just never a deployment."""
+        return self.state == "verified" and not self.unresolved_methods
 
 
 def _phase_dir(output_root: Path, build_id: str) -> Path:
@@ -330,6 +380,7 @@ def build(
     vendor_closure_files: int | None = None,
     vendor_entangled: list[str] | None = None,
     parity: dict | None = None,
+    plugin_source: str | Path | None = None,
 ) -> BuildResult:
     """Run the whole chain and emit one immutable bundle. Never writes live state.
 
@@ -403,7 +454,7 @@ def build(
         return _run_phases(staging, final, state, spec, pinned, inputs, build_id,
                           _refuse, wheel_builder, allow_gpu, vendor_closure_files,
                           vendor_entangled, parity, kata_rev, kata_forge_rev,
-                          kata_tree_hash, plugin_contract_version)
+                          kata_tree_hash, plugin_contract_version, plugin_source)
     except (BuildError, TrustedInputError):
         raise
     except BaseException as exc:
@@ -413,7 +464,8 @@ def build(
 
 def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, wheel_builder,
                 allow_gpu, vendor_closure_files, vendor_entangled, parity, kata_rev,
-                kata_forge_rev, kata_tree_hash, plugin_contract_version) -> BuildResult:
+                kata_forge_rev, kata_tree_hash, plugin_contract_version,
+                plugin_source=None) -> BuildResult:
     # 3 RESEARCH -- the credential scan first, so a leak stops the build before any AI input.
     state.phase = "research"
     write_build_state(staging, state)
@@ -437,12 +489,26 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
     # 6 SCAFFOLD -- the plugin, written only inside staging.
     state.state, state.phase = "drafting", "scaffold"
     write_build_state(staging, state)
-    from kata_forge.generator import generate
-
     plugin_parent = staging / "plugin"
     plugin_parent.mkdir(parents=True, exist_ok=True)
-    generate(spec, plugin_parent)
     plugin_tree = plugin_parent / spec.repo_name
+    if plugin_source is None:
+        # No completed plugin supplied: scaffold one. Its subnet-specific methods are declared
+        # UNRESOLVED, so the bundle is reviewable but the installer will refuse it.
+        from kata_forge.generator import generate
+
+        generate(spec, plugin_parent)
+    else:
+        # A COMPLETED plugin -- the realistic path, and how kata-sn126 and kata-sn60 exist today: a
+        # human writes the subnet-specific methods, and the build packages, pins and verifies them.
+        source_tree = Path(plugin_source).expanduser().resolve()
+        if not source_tree.is_dir():
+            raise BuildError(f"--plugin-src is not a directory: {source_tree}")
+        shutil.copytree(source_tree, plugin_tree, symlinks=False,
+                        ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".venv",
+                                                      ".pytest_cache", ".ruff_cache", "dist"))
+    state.unresolved_methods = read_unresolved_methods(plugin_tree)
+    write_build_state(staging, state)
 
     # 7-8 INTEGRATE + verify. The wheel is built in the Verify compartment: a build backend is
     # untrusted code and must not run on the build host.
@@ -487,4 +553,8 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
     # exists at the build id, so a crash can never leave a half-written bundle that looks finished.
     os.replace(staging, final)
     return BuildResult(build_id=build_id, bundle_dir=final, state="verified", mode=decision.mode,
-                       artifacts=sorted(manifest["tree_manifest"]))
+                       artifacts=sorted(manifest["tree_manifest"]),
+                       unresolved_methods=list(state.unresolved_methods or []),
+                       reason=("methods still UNRESOLVED: "
+                               + ", ".join(state.unresolved_methods or [])
+                               if state.unresolved_methods else ""))

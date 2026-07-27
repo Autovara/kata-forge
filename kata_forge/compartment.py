@@ -137,6 +137,13 @@ def build_argv(
     for path in _BASE_RO_PATHS:
         if Path(path).exists():
             command += ["--ro-bind", path, path]
+
+    # ORDER MATTERS: bwrap applies mounts in argument order, so the /tmp tmpfs is set up BEFORE any
+    # caller-supplied path. Reversed, the tmpfs overlays anything living under /tmp -- a workspace
+    # from mkdtemp, or a read-only build-tools fixture -- and the workload sees an empty directory
+    # instead, with no error. Both classes of caller path therefore come after it.
+    command += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+
     for path in (*compartment.ro_paths, *ro_extra):
         resolved = Path(path).expanduser().resolve()
         if not resolved.exists():
@@ -144,12 +151,6 @@ def build_argv(
         command += ["--ro-bind", str(resolved), str(resolved)]
 
     command += [
-        "--proc", "/proc",
-        "--dev", "/dev",
-        # ORDER MATTERS: bwrap applies mounts in argument order, so the /tmp tmpfs must be set up
-        # BEFORE the workspace bind. Reversed, the tmpfs overlays a workspace living under /tmp and
-        # the workload starts in an empty directory that silently is not the caller's.
-        "--tmpfs", "/tmp",
         "--bind", str(work), str(work),   # the single writable surface
         "--chdir", str(work),
         "--unshare-user",
