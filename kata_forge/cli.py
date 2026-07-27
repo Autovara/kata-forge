@@ -71,6 +71,31 @@ def build_parser() -> argparse.ArgumentParser:
     decide_cmd.add_argument("--allow-gpu", action="store_true",
                             help="Explicitly permit a GPU-requiring validator.")
 
+    # S7: the one-command chain. Non-root, transactional, and it never writes live state.
+    build_cmd = subcommands.add_parser(
+        "build", help="Resolve, fetch, decide and emit one immutable release bundle (S7).")
+    build_cmd.add_argument("--repo", default=None,
+                           help="Canonical https://github.com/<owner>/<repo> URL.")
+    build_cmd.add_argument("--subnet", type=int, default=None,
+                           help="Subnet number, resolved ONLY through --catalog.")
+    build_cmd.add_argument("--catalog", default=None, help="Local versioned subnet-catalog.json.")
+    build_cmd.add_argument("--commit", default=None, help="Pin at this full 40-character sha.")
+    build_cmd.add_argument("--out", default=None,
+                           help=f"Output root (or ${build_output_root_env()}); absolute, mode 0700.")
+    build_cmd.add_argument("--pack", required=True, help="Lane pack, e.g. sn44__poker44.")
+    build_cmd.add_argument("--evaluator", required=True, help="Evaluator id, e.g. sn44_poker44.")
+    build_cmd.add_argument("--mode", default="miner", help="Submission mode (default: miner).")
+    build_cmd.add_argument("--name", default="", help="Display slug (default: derived from --pack).")
+    build_cmd.add_argument("--kata-rev", required=True, help="Pinned kata revision.")
+    build_cmd.add_argument("--kata-bot-rev", required=True, help="Pinned kata-bot revision.")
+    build_cmd.add_argument("--kata-forge-rev", required=True, help="Pinned kata-forge revision.")
+    build_cmd.add_argument("--kata-tree-hash", required=True,
+                           help="Content hash of the installed kata core this bundle targets.")
+    build_cmd.add_argument("--new-attempt", action="store_true",
+                           help="Change the attempt nonce, producing a different build id.")
+    build_cmd.add_argument("--allow-gpu", action="store_true",
+                           help="Explicitly permit a GPU-requiring validator.")
+
     survey = subcommands.add_parser("survey", help="Rank many local repos as onboarding candidates.")
     survey.add_argument("paths", nargs="+", help="Local repo paths to analyze and rank.")
     survey.add_argument("--out", default="", help="Write the ranked table to this file.")
@@ -191,6 +216,60 @@ def _run_extract(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_output_root_env() -> str:
+    from kata_forge.build import OUTPUT_ROOT_ENV
+
+    return OUTPUT_ROOT_ENV
+
+
+def _handle_build(args: argparse.Namespace) -> int:
+    """Run the S7 chain. Exit 0 for a verified bundle, 2 for a refusal or a rejected input."""
+    import os
+
+    from kata_forge.build import OUTPUT_ROOT_ENV, BuildError, build
+    from kata_forge.pinned_fetch import PinnedFetchError
+    from kata_forge.spec import SubnetSpec
+    from kata_forge.trusted_input import TrustedInputError
+
+    output_root = args.out or os.environ.get(OUTPUT_ROOT_ENV)
+    if not output_root:
+        print(f"kata-forge: error: pass --out or set {OUTPUT_ROOT_ENV}", file=sys.stderr)
+        return 2
+    try:
+        spec = SubnetSpec(subnet_number=args.subnet or _subnet_from_pack(args.pack),
+                          pack=args.pack, evaluator_id=args.evaluator, mode=args.mode,
+                          name=args.name)
+        result = build(
+            output_root=output_root, spec=spec, repo=args.repo, subnet=args.subnet,
+            catalog_path=args.catalog, commit=args.commit, new_attempt=args.new_attempt,
+            allow_gpu=args.allow_gpu, kata_rev=args.kata_rev, kata_bot_rev=args.kata_bot_rev,
+            kata_forge_rev=args.kata_forge_rev, kata_tree_hash=args.kata_tree_hash,
+        )
+    except (TrustedInputError, PinnedFetchError, BuildError) as error:
+        print(f"kata-forge: REFUSE / NEEDS-HUMAN: {error}", file=sys.stderr)
+        return 2
+
+    print(f"kata-forge: {result.state} {result.build_id}")
+    print(f"  bundle: {result.bundle_dir}")
+    if result.reused:
+        print("  (existing build for identical inputs; pass --new-attempt to rebuild)")
+    if result.reason:
+        print(f"  reason: {result.reason}")
+    if result.installable:
+        print(f"  next: sudo kata-subnets stage --bundle {result.bundle_dir}")
+    return 0 if result.installable else 2
+
+
+def _subnet_from_pack(pack: str) -> int:
+    """``sn44__poker44`` -> 44. The pack already encodes the subnet, so it need not be repeated."""
+    import re
+
+    match = re.match(r"^sn(\d+)__", pack or "")
+    if not match:
+        raise ValueError(f"--pack must look like sn<N>__<slug>, got {pack!r}")
+    return int(match.group(1))
+
+
 def _handle_decide(args: argparse.Namespace) -> int:
     """Run the S5 decision pipeline. Exit 0 for VENDOR/CLONE, 2 for REFUSE, 2 for a refused input.
 
@@ -232,6 +311,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_survey(args)
     if args.command == "decide":  # S5 takes a canonical repo/subnet, not a spec
         return _handle_decide(args)
+    if args.command == "build":  # S7 builds its own spec from --pack/--evaluator
+        return _handle_build(args)
     try:
         spec = spec_from_args(args)
     except SpecError as error:
