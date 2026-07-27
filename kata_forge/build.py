@@ -243,6 +243,49 @@ def read_unresolved_methods(plugin_tree: Path) -> list[str]:
     return []
 
 
+
+def _draft_unresolved(plugin_tree: Path, methods: list[str], spec, staging: Path):
+    """Run the bounded draft loop, or return None when AI drafting is not configured.
+
+    Not configuring it is the normal case and not an error: the build proceeds with anchored stubs
+    and reports them honestly.
+    """
+    from kata_forge.ai_budget import AiBudget, AiDraftingDisabled, AiUsage, limits_from_env, write_ai_usage
+    from kata_forge.draft_loop import run_draft_loop
+
+    try:
+        limits = limits_from_env()
+    except AiDraftingDisabled:
+        return None
+    drafter = _load_drafter()
+    if drafter is None:
+        return None
+
+    usage = AiUsage(build_id=staging.name, provider=os.environ.get("KATA_FORGE_LLM", "unknown"),
+                    model=os.environ.get("KATA_FORGE_AI_MODEL", "unknown"), limits=limits)
+    outcome = run_draft_loop(plugin_tree, methods=list(methods), pack=spec.pack,
+                             budget=AiBudget(limits, usage), drafter=drafter)
+    # Provenance is written even when nothing was drafted: "we tried and it cost this" is exactly
+    # what a reviewer needs to see.
+    write_ai_usage(staging / "ai-usage.json", usage)
+    return outcome
+
+
+def _load_drafter():
+    """The configured drafter, or None. The forge ships no provider client by design -- a deployment
+    supplies one, and until it does, drafting is off."""
+    target = (os.environ.get("KATA_FORGE_DRAFTER") or "").strip()
+    if not target or ":" not in target:
+        return None
+    module_name, _, attribute = target.partition(":")
+    import importlib
+
+    try:
+        return getattr(importlib.import_module(module_name), attribute)
+    except (ImportError, AttributeError):
+        return None
+
+
 # ---- wheel -------------------------------------------------------------------------------------
 def build_wheel_in_compartment(plugin_dir: Path, out_dir: Path, workspace_root: Path) -> Path:
     """Build the plugin wheel INSIDE the Verify compartment.
@@ -509,6 +552,19 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
                                                       ".pytest_cache", ".ruff_cache", "dist"))
     state.unresolved_methods = read_unresolved_methods(plugin_tree)
     write_build_state(staging, state)
+
+    # 8 DRAFT (plan 6). Bounded, verified, and OFF unless every AI budget bound is configured. With
+    # no drafter every method simply stays UNRESOLVED -- which is why a scaffolded build is emitted
+    # for review but refused by the installer.
+    if state.unresolved_methods:
+        state.state, state.phase = "drafting", "draft"
+        write_build_state(staging, state)
+        draft = _draft_unresolved(plugin_tree, state.unresolved_methods, spec, staging)
+        if draft is not None:
+            state.unresolved_methods = draft.unresolved
+            _fsync_write(staging / "ai-draft.json",
+                         _canonical_json(draft.as_evidence()))
+            write_build_state(staging, state)
 
     # 7-8 INTEGRATE + verify. The wheel is built in the Verify compartment: a build backend is
     # untrusted code and must not run on the build host.

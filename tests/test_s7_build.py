@@ -292,3 +292,82 @@ def test_an_unexpected_failure_is_recorded_as_failed_and_never_promoted(out_root
     assert state["state"] == "failed" and "RuntimeError" in state["reason"]
     # Never promoted to the build id, so it cannot be staged by the installer.
     assert not any(p.is_dir() and not p.name.startswith(".") for p in out_root.iterdir())
+
+
+# ---- the draft loop closes the UNRESOLVED gap ----------------------------------------------------
+_DRAFTER_MODULE = '''\
+"""A deterministic stand-in drafter: no model, no network, no spend."""
+_BODIES = {
+    "sample_problems": "return [{'id': i} for i in range(3)]",
+    "benchmark_identity": "return 'synthetic-' + str(len(problems))",
+    "run_candidate": "return {'answers': [0] * len(problems)}",
+    "score": "return {'comparable': float(len(raw['answers'])), 'passed': True}",
+}
+
+
+def draft(method, prompt):
+    return _BODIES.get(method, "raise NotImplementedError('no draft')")
+'''
+
+
+@pytest.fixture
+def configured_drafter(tmp_path, monkeypatch):
+    """Point the build at a deterministic drafter with every AI bound configured."""
+    module_dir = tmp_path / "drafter"
+    module_dir.mkdir()
+    (module_dir / "demo_drafter.py").write_text(_DRAFTER_MODULE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(module_dir))
+    for name, value in {
+        "KATA_FORGE_AI_MAX_WALL_SECONDS": "600",
+        "KATA_FORGE_AI_MAX_INPUT_BYTES": "200000",
+        "KATA_FORGE_AI_MAX_OUTPUT_TOKENS": "4000",
+        "KATA_FORGE_AI_MAX_ATTEMPTS": "3",
+        "KATA_FORGE_DRAFTER": "demo_drafter:draft",
+        "KATA_FORGE_LLM": "demo",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_the_draft_loop_resolves_every_method_and_makes_the_bundle_installable(
+        out_root, configured_drafter):
+    """The gap that made `build` produce a bundle the installer refused: with drafting configured,
+    every scaffolded method is drafted, verified and spliced, and the result is installable."""
+    result = _build(out_root)
+
+    assert result.unresolved_methods == [] and result.installable
+    draft = json.loads((result.bundle_dir / "ai-draft.json").read_text())
+    assert sorted(draft["drafted"]) == ["benchmark_identity", "run_candidate",
+                                        "sample_problems", "score"]
+    # The plugin no longer RAISES from the methods a challenge calls. (The module docstring still
+    # mentions NotImplementedError while describing the scaffold, so match the statement, not the
+    # word.)
+    plugin = next((result.bundle_dir / "plugin").rglob("plugin.py")).read_text()
+    assert "raise NotImplementedError" not in plugin
+
+
+def test_drafting_writes_redacted_provenance(out_root, configured_drafter):
+    result = _build(out_root)
+    usage = json.loads((result.bundle_dir / "ai-usage.json").read_text())
+    assert [a["result"] for a in usage["attempts"]] == ["passed"] * 4
+    assert usage["limits"]["max_attempts"] == 3
+    # Counts and hashes only -- no prompt text, no source, no credential.
+    assert "prompt" not in json.dumps(usage).lower().replace("prompt_template_sha256", "")
+
+
+def test_a_drafter_that_never_succeeds_leaves_an_honest_unresolved_build(out_root, monkeypatch,
+                                                                        tmp_path):
+    module_dir = tmp_path / "baddrafter"
+    module_dir.mkdir()
+    (module_dir / "bad_drafter.py").write_text(
+        "def draft(method, prompt):\n    return 'def broken(:'\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(module_dir))
+    for name, value in {"KATA_FORGE_AI_MAX_WALL_SECONDS": "600",
+                        "KATA_FORGE_AI_MAX_INPUT_BYTES": "200000",
+                        "KATA_FORGE_AI_MAX_OUTPUT_TOKENS": "4000",
+                        "KATA_FORGE_AI_MAX_ATTEMPTS": "2",
+                        "KATA_FORGE_DRAFTER": "bad_drafter:draft"}.items():
+        monkeypatch.setenv(name, value)
+
+    result = _build(out_root)
+    assert result.unresolved_methods and not result.installable
+    assert result.state == "verified"  # the BUILD completed; the methods did not
