@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 # pack: ``sn<N>__<slug>`` (matches the platform's lanes/<pack>/ keying), e.g. ``sn126__poker44``.
 _PACK_RE = re.compile(r"^sn(\d+)__([a-z0-9]+(?:_[a-z0-9]+)*)$")
+_LANE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 # evaluator id: lowercase identifier the core resolves the plugin by, e.g. ``sn126_poker44``.
 _EVALUATOR_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _MODE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -71,6 +72,10 @@ def validate_spec(
     pack_match = _PACK_RE.match(pack or "")
     if not pack_match:
         raise SpecError(f"--pack must look like sn<N>__<slug> (lowercase), got {pack!r}")
+    if not _LANE_ID_RE.fullmatch(pack):
+        raise SpecError(
+            f"--pack becomes the lane id and must match {_LANE_ID_RE.pattern}, got {pack!r}"
+        )
     if int(pack_match.group(1)) != subnet_number:
         raise SpecError(f"--pack {pack!r} must start with sn{subnet_number}__")
     if not _EVALUATOR_RE.match(evaluator_id or ""):
@@ -91,9 +96,9 @@ def validate_spec(
 def spec_from_args(args: object) -> SubnetSpec:
     """Build and validate a spec from a parsed argparse namespace."""
     return validate_spec(
-        subnet_number=getattr(args, "subnet"),
-        pack=getattr(args, "pack"),
-        evaluator_id=getattr(args, "evaluator"),
+        subnet_number=args.subnet,
+        pack=args.pack,
+        evaluator_id=args.evaluator,
         mode=getattr(args, "mode", "miner"),
         name=getattr(args, "name", "") or "",
     )

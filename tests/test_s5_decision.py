@@ -33,15 +33,19 @@ def _passing_parity(cases=2):
     return ParityResult(executed=True, matched=True, cases_run=cases).as_evidence()
 
 
+def _vendor_files(count: int) -> list[str]:
+    return [f"scorer_{index}.py" for index in range(count)]
+
+
 def _inputs(**over):
-    base = dict(
-        source_url="https://github.com/o/r",
-        source_commit=FULL_SHA,
-        dep_verdict="FREE",
-        cost_class="FREE",
-        needs_gpu=False,
-        license={"spdx": "MIT", "vendor_allowed": True, "reason": "permissive"},
-    )
+    base = {
+        "source_url": "https://github.com/o/r",
+        "source_commit": FULL_SHA,
+        "dep_verdict": "FREE",
+        "cost_class": "FREE",
+        "needs_gpu": False,
+        "license": {"spdx": "MIT", "vendor_allowed": True, "reason": "permissive"},
+    }
     base.update(over)
     return DecisionInputs(**base)
 
@@ -49,7 +53,11 @@ def _inputs(**over):
 # ---- the plan's named acceptance cases -----------------------------------------------------------
 def test_a_pure_shaped_free_scorer_yields_vendor():
     """SN126-shaped: a tiny pure closure, permissive licence, no entanglement."""
-    decision = decide(_inputs(vendor_closure_files=2, vendor_entangled=[]))
+    decision = decide(_inputs(
+        vendor_closure_files=2,
+        vendor_files=_vendor_files(2),
+        vendor_entangled=[],
+    ))
     assert decision.mode == VENDOR
     assert "closure 2 file(s)" in " ".join(decision.reasons)
 
@@ -102,7 +110,12 @@ def test_a_paid_validator_refuses_even_with_passing_parity(over):
 
 def test_gpu_refuses_unless_explicitly_allowed():
     assert decide(_inputs(needs_gpu=True, vendor_closure_files=1)).mode == REFUSE
-    assert decide(_inputs(needs_gpu=True, allow_gpu=True, vendor_closure_files=1)).mode == VENDOR
+    assert decide(_inputs(
+        needs_gpu=True,
+        allow_gpu=True,
+        vendor_closure_files=1,
+        vendor_files=_vendor_files(1),
+    )).mode == VENDOR
 
 
 def test_license_blocks_vendor_but_not_clone():
@@ -116,8 +129,26 @@ def test_license_blocks_vendor_but_not_clone():
 
 
 def test_a_closure_above_the_cap_is_not_vendorable():
-    assert decide(_inputs(vendor_closure_files=MAX_VENDOR_FILES)).mode == VENDOR
-    assert decide(_inputs(vendor_closure_files=MAX_VENDOR_FILES + 1)).mode == REFUSE
+    assert decide(_inputs(
+        vendor_closure_files=MAX_VENDOR_FILES,
+        vendor_files=_vendor_files(MAX_VENDOR_FILES),
+    )).mode == VENDOR
+    assert decide(_inputs(
+        vendor_closure_files=MAX_VENDOR_FILES + 1,
+        vendor_files=_vendor_files(MAX_VENDOR_FILES + 1),
+    )).mode == REFUSE
+
+
+def test_a_vendor_count_without_the_exact_file_list_is_not_a_proof():
+    decision = decide(_inputs(vendor_closure_files=1))
+    assert decision.mode == REFUSE
+    assert "count alone does not identify bytes" in " ".join(decision.reasons)
+
+
+def test_a_vendor_count_must_match_the_exact_file_list():
+    decision = decide(_inputs(vendor_closure_files=2, vendor_files=["scorer.py"]))
+    assert decision.mode == REFUSE
+    assert "file list length" in " ".join(decision.reasons)
 
 
 # ---- the parity fixture must have ACTUALLY executed ----------------------------------------------
@@ -174,7 +205,7 @@ def test_a_raising_comparator_is_not_a_match():
 
 # ---- the decision record -------------------------------------------------------------------------
 def test_every_outcome_writes_a_record_with_evidence(tmp_path):
-    for inputs in (_inputs(vendor_closure_files=1),
+    for inputs in (_inputs(vendor_closure_files=1, vendor_files=_vendor_files(1)),
                    _inputs(vendor_closure_files=99, vendor_entangled=["docker"],
                            parity=_passing_parity()),
                    _inputs(vendor_closure_files=99, parity={})):
@@ -189,7 +220,7 @@ def test_every_outcome_writes_a_record_with_evidence(tmp_path):
 
 
 def test_the_record_is_canonical_and_reproducible(tmp_path):
-    decision = decide(_inputs(vendor_closure_files=1))
+    decision = decide(_inputs(vendor_closure_files=1, vendor_files=_vendor_files(1)))
     first = write_decision_record(tmp_path / "a.json", decision).read_text()
     second = write_decision_record(tmp_path / "b.json", decision).read_text()
     assert first == second and first.endswith("\n")  # deterministic evidence

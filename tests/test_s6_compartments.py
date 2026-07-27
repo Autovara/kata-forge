@@ -305,6 +305,8 @@ def test_a_provider_that_ignores_the_output_cap_is_a_violation():
     with pytest.raises(AiBudgetExhausted, match="output tokens"):
         budget.record_attempt(method="score", attempt=1, template_hash="h", prompt_bytes=10,
                               input_tokens=5, output_tokens=101, elapsed=1.0, result="ok")
+    assert budget.usage.output_tokens == 101
+    assert budget.usage.attempts[0]["result"] == "output-limit-violation"
 
 
 def test_spend_is_only_enforced_when_it_is_a_hard_cap():
@@ -369,3 +371,18 @@ def test_git_runs_inside_the_fetch_compartment(tmp_path):
     # And the surrounding compartment is genuinely unprivileged.
     run = run_in_compartment(FETCH, ["/usr/bin/id", "-u"], workspace=workspace)
     assert run.stdout.strip() == str(SANDBOX_UID)
+
+
+def test_fetch_refuses_when_the_compartment_is_unavailable(tmp_path, monkeypatch):
+    """Production fetch must never silently downgrade to host git."""
+    import kata_forge.compartment as compartment_module
+    from kata_forge.pinned_fetch import PinnedFetchError, compartment_git_runner
+
+    workspace = fresh_workspace(tmp_path, "gitns-unavailable")
+
+    def unavailable(*_args, **_kwargs):
+        raise compartment_module.CompartmentUnavailable("namespace launcher missing")
+
+    monkeypatch.setattr(compartment_module, "run_in_compartment", unavailable)
+    with pytest.raises(PinnedFetchError, match="refusing to run git on the host"):
+        compartment_git_runner(workspace)(["--version"])

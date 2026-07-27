@@ -7,9 +7,9 @@
 
 The shape matters more than the model. Three properties hold regardless of which CLI is plugged in:
 
-* **A method is never reported done unless its verification passed.** A draft that lints, imports and
-  runs is accepted; anything else is discarded and the anchored stub is restored. There is no
-  "probably fine" path.
+* **A method is never reported done unless an explicitly supplied authoritative subnet fixture
+  passed.** Syntax parsing is only a preflight/debugging tool; it cannot prove scorer or execution
+  semantics. Anything not accepted by the fixture is discarded and the anchored stub is restored.
 * **The budget is checked before every call**, and exhaustion ends the loop as UNRESOLVED rather than
   as a partial claim. Running out of attempts is a normal outcome, not an error.
 * **Drafting happens in the Draft compartment** — no network, no credentials — so a prompt-injected
@@ -21,7 +21,6 @@ default, and it is why a scaffolded build is emitted for review but refused by t
 from __future__ import annotations
 
 import shutil
-import subprocess
 import tempfile
 import time
 from collections.abc import Callable
@@ -59,16 +58,17 @@ class DraftOutcome:
 
 
 class Verifier:
-    """Verifies one drafted plugin tree: every module must parse, and ruff must be clean.
+    """Syntax-checks one drafted plugin tree inside the Draft compartment.
 
-    Runs in the DRAFT compartment when the host can build one. That matters because the thing being
+    This is deliberately NOT an authoritative acceptance verifier. It runs in DRAFT because the thing
+    being
     verified is model output over a fetched source tree: running ruff and `compile()` on it is
     executing a parser against attacker-influenced input, with no network and no credentials
-    available to it. Where a compartment cannot be built it falls back to running locally, which is
-    still only parsing — but the isolated path is the default.
+    available to it. A host that cannot build the compartment returns a failed verification; it
+    never falls back to parsing attacker-controlled output in the host process.
 
-    Deliberately a class so the whole verification can be swapped in a test without also swapping
-    the loop's control flow — the control flow is the part being tested.
+    An onboarding build must provide a subnet-specific fixture to ``run_draft_loop``; syntax alone
+    never removes an UNRESOLVED marker.
     """
 
     def __init__(self, python: str = "python3", timeout: int = 300, *, isolated: bool = True):
@@ -113,30 +113,16 @@ class Verifier:
     def verify(self, plugin_tree: Path) -> tuple[bool, str]:
         """(ok, failure text). The failure text is fed back into the next attempt's prompt.
 
-        Two checks, cheapest first: every module must parse, then ruff must be clean. Parsing first
-        means a syntactically broken draft produces a precise error to feed back rather than a wall
-        of lint noise about a file the linter could not read either.
+        A syntactically broken draft produces a precise error to feed back. Repository-wide Ruff
+        still runs as a source-quality gate, but it is not executed over untrusted draft output on
+        the host.
         """
-        isolated = self._run_isolated(plugin_tree) if self.isolated else None
-        if isolated is not None:
-            if not isolated[0]:
-                return isolated
-        else:
-            # No compartment available (or isolation switched off): parse locally. Still only a
-            # parser over the source, never an import, so nothing from the draft executes.
-            for module in sorted(plugin_tree.rglob("*.py")):
-                try:
-                    compile(module.read_text(encoding="utf-8"), str(module), "exec")
-                except (OSError, SyntaxError) as exc:
-                    return False, f"{module.name} does not parse: {exc}"
-
-        ruff = shutil.which("ruff")
-        if ruff is not None:
-            result = subprocess.run([ruff, "check", str(plugin_tree)], capture_output=True,
-                                    text=True, timeout=self.timeout, check=False)
-            if result.returncode != 0:
-                return False, f"ruff: {(result.stdout or result.stderr).strip()[:800]}"
-        return True, ""
+        if not self.isolated:
+            return False, "draft verification isolation was explicitly disabled"
+        isolated = self._run_isolated(plugin_tree)
+        if isolated is None:
+            return False, "Draft compartment unavailable; refusing host verification"
+        return isolated
 
 
 def _method_source_is_stub(source: str, method: str) -> bool:
@@ -158,8 +144,13 @@ def run_draft_loop(
     if drafter is None:
         outcome.exhausted_reason = "no drafter configured; AI drafting is off by default"
         return outcome
+    if verify is None:
+        outcome.exhausted_reason = (
+            "no authoritative subnet verifier configured; refusing to call AI for syntax-only proof"
+        )
+        return outcome
 
-    verifier = verify or Verifier().verify
+    verifier = verify
     template_hash = prompt_template_hash(PROMPT_TEMPLATE)
     anchors = anchors or {}
     plugin_file = next(iter(sorted(plugin_tree.rglob("plugin.py"))), None)
@@ -182,6 +173,9 @@ def run_draft_loop(
                 return outcome
 
             started = time.monotonic()
+            # This is an attempted model call even if the provider raises. Keep the summary count
+            # aligned with the durable per-attempt usage record rather than under-reporting faults.
+            outcome.attempts_used += 1
             try:
                 drafted = drafter(method, prompt)
             except Exception as exc:  # noqa: BLE001 - a drafter fault is a failed attempt, not a crash
@@ -193,14 +187,37 @@ def run_draft_loop(
                 continue
 
             candidate = _splice(original, method, drafted)
+            if candidate == original:
+                feedback = (
+                    f"\nThe previous attempt could not replace the anchored {method} stub."
+                )
+                try:
+                    budget.record_attempt(
+                        method=method,
+                        attempt=attempt,
+                        template_hash=template_hash,
+                        prompt_bytes=len(prompt.encode("utf-8")),
+                        input_tokens=0,
+                        output_tokens=len(drafted.split()),
+                        elapsed=time.monotonic() - started,
+                        result="failed-splice",
+                    )
+                except AiBudgetExhausted as exc:
+                    outcome.exhausted_reason = str(exc)
+                    return outcome
+                continue
             plugin_file.write_text(candidate, encoding="utf-8")
             ok, failure = verifier(plugin_tree)
-            budget.record_attempt(
-                method=method, attempt=attempt, template_hash=template_hash,
-                prompt_bytes=len(prompt.encode("utf-8")), input_tokens=0,
-                output_tokens=len(drafted.split()), elapsed=time.monotonic() - started,
-                result="passed" if ok else "failed-verification")
-            outcome.attempts_used += 1
+            try:
+                budget.record_attempt(
+                    method=method, attempt=attempt, template_hash=template_hash,
+                    prompt_bytes=len(prompt.encode("utf-8")), input_tokens=0,
+                    output_tokens=len(drafted.split()), elapsed=time.monotonic() - started,
+                    result="passed" if ok else "failed-verification")
+            except AiBudgetExhausted as exc:
+                plugin_file.write_text(original, encoding="utf-8")
+                outcome.exhausted_reason = str(exc)
+                return outcome
             if ok:
                 outcome.drafted.append(method)
                 outcome.unresolved.remove(method)
@@ -228,9 +245,15 @@ def _splice(source: str, method: str, body: str) -> str:
     raise_at = source.find("raise NotImplementedError", start)
     if raise_at == -1:
         return source
+    line_start = source.rfind("\n", start, raise_at) + 1
+    indent = source[line_start:raise_at]
+    if not indent or indent.strip():
+        return source
     line_end = source.find("\n", raise_at)
     if line_end == -1:
         return source
-    indented = "\n".join(f"        {line}" if line.strip() else ""
-                         for line in body.strip().splitlines())
-    return source[:raise_at] + indented.lstrip() + source[line_end:]
+    lines = body.strip().splitlines()
+    if not lines:
+        return source
+    indented = "\n".join(f"{indent}{line}" if line.strip() else "" for line in lines)
+    return source[:line_start] + indented + source[line_end:]

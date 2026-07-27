@@ -34,6 +34,7 @@ def test_name_overrides_slug() -> None:
         {"subnet_number": 126, "pack": "poker44", "evaluator_id": "sn126_poker44"},  # bad pack shape
         {"subnet_number": 126, "pack": "sn99__poker44", "evaluator_id": "sn126_poker44"},  # number mismatch
         {"subnet_number": 126, "pack": "sn126__Poker44", "evaluator_id": "sn126_poker44"},  # uppercase pack
+        {"subnet_number": 60, "pack": "sn60__" + "x" * 35, "evaluator_id": "sn60_x"},  # lane id >40
         {"subnet_number": 126, "pack": "sn126__poker44", "evaluator_id": "Sn126"},  # bad evaluator
         {"subnet_number": 126, "pack": "sn126__poker44", "evaluator_id": "sn126", "mode": "Miner"},  # bad mode
     ],

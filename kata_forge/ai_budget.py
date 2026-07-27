@@ -185,23 +185,22 @@ class AiBudget:
             raise AiBudgetExhausted(
                 f"this prompt would bring input to {projected}B, over "
                 f"{MAX_INPUT_BYTES_ENV}={self.limits.max_input_bytes}")
-        if self.limits.spend_is_hard_cap and self.limits.max_spend_usd is not None:
-            if self.usage.spend_usd >= self.limits.max_spend_usd:
-                raise AiBudgetExhausted(
-                    f"spend {self.usage.spend_usd} has reached "
-                    f"{MAX_SPEND_USD_ENV}={self.limits.max_spend_usd}")
+        if (
+            self.limits.spend_is_hard_cap
+            and self.limits.max_spend_usd is not None
+            and self.usage.spend_usd >= self.limits.max_spend_usd
+        ):
+            raise AiBudgetExhausted(
+                f"spend {self.usage.spend_usd} has reached "
+                f"{MAX_SPEND_USD_ENV}={self.limits.max_spend_usd}")
 
     def record_attempt(self, *, method: str, attempt: int, template_hash: str, prompt_bytes: int,
                        input_tokens: int, output_tokens: int, elapsed: float, result: str,
                        redactions: int = 0, spend_usd: float = 0.0) -> None:
         """Record one attempt. Deliberately takes counts and a hash — there is no parameter through
         which a raw prompt, source snippet, or credential could enter this record."""
-        if output_tokens > self.limits.max_output_tokens:
-            # The provider was asked to cap this and did not. Treat as a violation rather than
-            # silently accepting a larger (and larger-cost) response.
-            raise AiBudgetExhausted(
-                f"provider returned {output_tokens} output tokens, over the requested "
-                f"{MAX_OUTPUT_TOKENS_ENV}={self.limits.max_output_tokens}")
+        output_violation = output_tokens > self.limits.max_output_tokens
+        recorded_result = "output-limit-violation" if output_violation else result
         self.usage.attempts.append({
             "method": method,
             "attempt": attempt,
@@ -210,7 +209,7 @@ class AiBudget:
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "elapsed_seconds": round(elapsed, 3),
-            "result": result,
+            "result": recorded_result,
             "redactions": redactions,
         })
         self.usage.input_bytes += prompt_bytes
@@ -219,6 +218,13 @@ class AiBudget:
         self.usage.elapsed_seconds += elapsed
         self.usage.spend_usd += spend_usd
         self.usage.redaction_count += redactions
+        if output_violation:
+            # The provider was asked to cap this and did not. Record the cost first, then fail
+            # closed: otherwise the usage file would under-report the very response that violated
+            # the limit.
+            raise AiBudgetExhausted(
+                f"provider returned {output_tokens} output tokens, over the requested "
+                f"{MAX_OUTPUT_TOKENS_ENV}={self.limits.max_output_tokens}")
 
 
 def write_ai_usage(path: str | Path, usage: AiUsage) -> tuple[Path, str]:

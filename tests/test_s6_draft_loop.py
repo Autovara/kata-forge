@@ -6,6 +6,8 @@ the budget is consulted before every call.
 """
 from __future__ import annotations
 
+import ast
+
 import pytest
 
 from kata_forge.ai_budget import AiBudget, AiUsage, limits_from_env
@@ -56,6 +58,20 @@ def test_with_no_drafter_every_method_stays_unresolved(plugin_tree):
     assert "off by default" in outcome.exhausted_reason
 
 
+def test_a_drafter_without_an_authoritative_verifier_is_never_called(plugin_tree):
+    calls = []
+    outcome = run_draft_loop(
+        plugin_tree,
+        methods=["score"],
+        pack="sn44__poker44",
+        budget=_budget(),
+        drafter=lambda method, prompt: calls.append((method, prompt)) or "return 42",
+    )
+    assert calls == []
+    assert outcome.unresolved == ["score"]
+    assert "authoritative subnet verifier" in outcome.exhausted_reason
+
+
 # ---- a passing draft is accepted ----------------------------------------------------------------
 def test_a_verified_draft_is_accepted_and_spliced(plugin_tree):
     outcome = run_draft_loop(
@@ -65,6 +81,8 @@ def test_a_verified_draft_is_accepted_and_spliced(plugin_tree):
     assert outcome.drafted == ["score"] and outcome.unresolved == []
     body = (plugin_tree / "kata_sn44" / "plugin.py").read_text()
     assert "return 42" in body and "NotImplementedError" not in body
+    ast.parse(body)
+    assert "    def score(self, raw, problems):\n        return 42\n" in body
 
 
 # ---- a failing draft is never accepted ----------------------------------------------------------
@@ -87,7 +105,7 @@ def test_the_failure_is_fed_back_into_the_next_attempt(plugin_tree):
         return "return 1"
 
     run_draft_loop(plugin_tree, methods=["score"], pack="sn44__poker44",
-                   budget=_budget(**{"KATA_FORGE_AI_MAX_ATTEMPTS": "3"}),
+                   budget=_budget(KATA_FORGE_AI_MAX_ATTEMPTS="3"),
                    drafter=drafter, verify=_bad_verify)
 
     assert len(seen) == 3, "it must use its whole attempt budget before giving up"
@@ -96,7 +114,7 @@ def test_the_failure_is_fed_back_into_the_next_attempt(plugin_tree):
 
 def test_attempts_are_bounded_and_exhaustion_is_honest(plugin_tree):
     outcome = run_draft_loop(plugin_tree, methods=["score"], pack="sn44__poker44",
-                             budget=_budget(**{"KATA_FORGE_AI_MAX_ATTEMPTS": "2"}),
+                             budget=_budget(KATA_FORGE_AI_MAX_ATTEMPTS="2"),
                              drafter=lambda m, p: "return 1", verify=_bad_verify)
     assert outcome.attempts_used == 2 and outcome.unresolved == ["score"]
 
@@ -105,7 +123,7 @@ def test_a_raising_drafter_is_a_failed_attempt_not_a_crash(plugin_tree):
     def boom(_method, _prompt):
         raise RuntimeError("provider timeout")
 
-    budget = _budget(**{"KATA_FORGE_AI_MAX_ATTEMPTS": "2"})
+    budget = _budget(KATA_FORGE_AI_MAX_ATTEMPTS="2")
     outcome = run_draft_loop(plugin_tree, methods=["score"], pack="sn44__poker44",
                              budget=budget, drafter=boom, verify=_ok_verify)
 
@@ -117,7 +135,7 @@ def test_a_raising_drafter_is_a_failed_attempt_not_a_crash(plugin_tree):
 
 # ---- budget + provenance ------------------------------------------------------------------------
 def test_the_budget_is_consulted_before_every_call(plugin_tree):
-    budget = _budget(**{"KATA_FORGE_AI_MAX_INPUT_BYTES": "10"})  # smaller than any prompt
+    budget = _budget(KATA_FORGE_AI_MAX_INPUT_BYTES="10")  # smaller than any prompt
     calls: list[str] = []
     outcome = run_draft_loop(plugin_tree, methods=["score"], pack="sn44__poker44", budget=budget,
                              drafter=lambda m, p: calls.append(m) or "return 1", verify=_ok_verify)
@@ -150,11 +168,52 @@ def test_the_real_verifier_accepts_clean_source(plugin_tree):
 
 def test_a_splice_that_cannot_locate_the_stub_changes_nothing(plugin_tree):
     """A failed splice must read as a failed attempt, never as a corrupted plugin."""
+    verify_calls = []
     outcome = run_draft_loop(plugin_tree, methods=["no_such_method"], pack="sn44__poker44",
-                             budget=_budget(), drafter=lambda m, p: "return 1", verify=_ok_verify)
+                             budget=_budget(), drafter=lambda m, p: "return 1",
+                             verify=lambda tree: verify_calls.append(tree) or (True, ""))
     body = (plugin_tree / "kata_sn44" / "plugin.py").read_text()
-    assert body == STUB_PLUGIN or "NotImplementedError" in body
-    assert outcome.drafted in ([], ["no_such_method"])  # never a corrupted tree
+    assert body == STUB_PLUGIN
+    assert outcome.drafted == []
+    assert outcome.unresolved == ["no_such_method"]
+    assert verify_calls == [], "an unchanged splice cannot be handed to a permissive verifier"
+
+
+def test_a_provider_error_counts_as_an_attempt(plugin_tree):
+    budget = _budget(KATA_FORGE_AI_MAX_ATTEMPTS="2")
+
+    def fail(_method, _prompt):
+        raise RuntimeError("provider unavailable")
+
+    outcome = run_draft_loop(
+        plugin_tree,
+        methods=["score"],
+        pack="sn44__poker44",
+        budget=budget,
+        drafter=fail,
+        verify=_ok_verify,
+    )
+
+    assert outcome.attempts_used == 2
+    assert len(budget.usage.attempts) == 2
+
+
+def test_an_over_limit_response_is_recorded_reverted_and_left_unresolved(plugin_tree):
+    budget = _budget(KATA_FORGE_AI_MAX_OUTPUT_TOKENS="1")
+    outcome = run_draft_loop(
+        plugin_tree,
+        methods=["score"],
+        pack="sn44__poker44",
+        budget=budget,
+        drafter=lambda _method, _prompt: "return 42",
+        verify=_ok_verify,
+    )
+
+    assert outcome.unresolved == ["score"]
+    assert outcome.drafted == []
+    assert "over the requested" in outcome.exhausted_reason
+    assert budget.usage.attempts[0]["result"] == "output-limit-violation"
+    assert (plugin_tree / "kata_sn44" / "plugin.py").read_text() == STUB_PLUGIN
 
 
 def test_the_verifier_isolates_by_default_and_still_rejects_bad_source(plugin_tree):
@@ -165,11 +224,10 @@ def test_the_verifier_isolates_by_default_and_still_rejects_bad_source(plugin_tr
     assert not ok and "does not parse" in failure
 
 
-def test_the_verifier_agrees_with_itself_isolated_or_not(plugin_tree):
-    """The isolated and local paths must reach the same verdict; otherwise the fallback would be a
-    silently weaker gate."""
+def test_the_verifier_refuses_when_isolation_is_disabled(plugin_tree):
+    """There is no host fallback: disabling isolation is a failed verification."""
     assert Verifier(isolated=True).verify(plugin_tree)[0] is True
-    assert Verifier(isolated=False).verify(plugin_tree)[0] is True
+    assert Verifier(isolated=False).verify(plugin_tree)[0] is False
 
     (plugin_tree / "kata_sn44" / "plugin.py").write_text("class P:\n  def x(:\n", encoding="utf-8")
     assert Verifier(isolated=True).verify(plugin_tree)[0] is False

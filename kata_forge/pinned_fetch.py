@@ -70,15 +70,16 @@ _GIT_ENV = {
 def _host_git_runner(args: list[str]) -> tuple[int, str, str]:
     """Run git directly on the host, with a scrubbed environment.
 
-    The FALLBACK, used only where a compartment cannot be built. It keeps the credential-scrubbing
-    property but not the filesystem isolation, so ``compartment_git_runner`` is preferred.
+    This is a development/test seam for direct ``fetch_pinned`` callers. Production onboarding and
+    builds explicitly pass ``compartment_git_runner`` and fail closed if isolation is unavailable.
+    It keeps credential scrubbing but provides no filesystem-isolation claim.
     """
     completed = subprocess.run(["git", *args], capture_output=True, text=True,
                                env=dict(_GIT_ENV), timeout=900, check=False)
     return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
 
 
-def compartment_git_runner(workspace: "Path") -> GitRunner:
+def compartment_git_runner(workspace: Path) -> GitRunner:
     """A git runner that executes inside the FETCH compartment (plan 7.4).
 
     Fetch is the one compartment with egress, and it must have no credentials, no operator home and
@@ -91,17 +92,21 @@ def compartment_git_runner(workspace: "Path") -> GitRunner:
     def _run(args: list[str]) -> tuple[int, str, str]:
         try:
             result = run_in_compartment(FETCH, ["/usr/bin/git", *args], workspace=workspace)
-        except CompartmentUnavailable:
-            # Fail closed on isolation is wrong HERE: refusing to fetch at all would block every
-            # build on a host that cannot namespace. Degrade to the scrubbed host runner and let the
-            # caller see it in the build record rather than silently believing it was isolated.
-            return _host_git_runner(args)
+        except CompartmentUnavailable as exc:
+            # The production Fetch contract is isolation, not merely environment scrubbing. Falling
+            # back here used to make an unisolated clone indistinguishable from a compartmented one
+            # in build-state.json. Refuse instead: an operator can repair the namespace launcher,
+            # whereas a bundle carrying false isolation evidence can no longer be made trustworthy.
+            raise PinnedFetchError(
+                f"Fetch compartment unavailable; refusing to run git on the host: {exc}"
+            ) from exc
         return result.returncode, result.stdout.strip(), result.stderr.strip()
 
     return _run
 
 
 def _default_git_runner(args: list[str]) -> tuple[int, str, str]:
+    """Development/test default. Production entry points always inject the compartment runner."""
     return _host_git_runner(args)
 
 

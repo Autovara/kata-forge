@@ -102,6 +102,7 @@ def test_sn126_decides_vendor(tmp_path):
         needs_gpu=facts["needs_gpu"], embedded_secrets=facts["embedded_secrets"],
         license=facts["license"],
         vendor_closure_files=1,   # the single pure scorer module
+        vendor_files=[SN126_SCORER],
         vendor_entangled=[],
     ))
     assert decision.mode == VENDOR
@@ -116,10 +117,16 @@ def test_sn60_is_not_vendorable_and_reaches_clone_on_an_executed_parity(tmp_path
     source = fetch_pinned(parse_canonical_github_url(SN60_REPO), tmp_path / "sandbox",
                           commit=SN60_COMMIT)
     facts = _research(source.path)
-    shape = dict(source_url=source.url, source_commit=source.commit,
-                 dep_verdict="FREE", cost_class="FREE", needs_gpu=False,
-                 license=facts["license"], vendor_closure_files=facts["py_files"],
-                 vendor_entangled=["docker", "bittensor"])
+    shape = {
+        "source_url": source.url,
+        "source_commit": source.commit,
+        "dep_verdict": "FREE",
+        "cost_class": "FREE",
+        "needs_gpu": False,
+        "license": facts["license"],
+        "vendor_closure_files": facts["py_files"],
+        "vendor_entangled": ["docker", "bittensor"],
+    }
 
     assert decide(DecisionInputs(**shape)).mode == REFUSE  # no parity -> not CLONE either
 
@@ -257,6 +264,14 @@ def test_a_clone_bundle_is_emitted_from_a_real_executed_parity_fixture(tmp_path)
     assert decision["evidence"]["parity"]["executed"] is True
     assert decision["evidence"]["parity"]["cases_run"] == 3
     assert decision["evidence"]["source"]["commit"] == "d" * 40  # pinned full commit
+    manifest = json.loads((result.bundle_dir / "release-manifest.json").read_text())
+    integration = manifest["integration"]
+    assert integration["mode"] == "clone"
+    assert integration["source_url"] == "https://github.com/Autovara/parity-demo"
+    assert integration["source_commit"] == "d" * 40
+    upstream = result.bundle_dir / integration["tree_root"]
+    assert (upstream / "docker-compose.yml").is_file()
+    assert len(list(upstream.glob("mod_*.py"))) == 40
 
 
 def test_a_clone_is_refused_when_the_same_fixture_disagrees(tmp_path):

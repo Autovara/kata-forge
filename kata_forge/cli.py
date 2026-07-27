@@ -70,6 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
     decide_cmd.add_argument("--out", required=True, help="Where to write integration-decision.json.")
     decide_cmd.add_argument("--allow-gpu", action="store_true",
                             help="Explicitly permit a GPU-requiring validator.")
+    decide_cmd.add_argument("--vendor-closure-files", type=int, default=None)
+    decide_cmd.add_argument("--vendor-file", action="append", default=[])
+    decide_cmd.add_argument("--vendor-entangled", default="")
+    decide_cmd.add_argument("--parity-json", default=None)
 
     # S7: the one-command chain. Non-root, transactional, and it never writes live state.
     build_cmd = subcommands.add_parser(
@@ -77,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_cmd.add_argument("--repo", default=None,
                            help="Canonical https://github.com/<owner>/<repo> URL.")
     build_cmd.add_argument("--subnet", type=int, default=None,
-                           help="Subnet number, resolved ONLY through --catalog.")
+                           help="Subnet identity; with no --repo, resolves source through --catalog.")
     build_cmd.add_argument("--catalog", default=None, help="Local versioned subnet-catalog.json.")
     build_cmd.add_argument("--commit", default=None, help="Pin at this full 40-character sha.")
     build_cmd.add_argument("--out", default=None,
@@ -107,6 +111,12 @@ def build_parser() -> argparse.ArgumentParser:
                            help="A COMPLETED plugin tree to package instead of scaffolding one.")
     build_cmd.add_argument("--vendor-closure-files", type=int, default=None,
                            help="Measured scorer closure size (VENDOR evidence).")
+    build_cmd.add_argument(
+        "--vendor-file",
+        action="append",
+        default=[],
+        help="Exact pinned-source file in the VENDOR closure; repeat for every file.",
+    )
     build_cmd.add_argument("--vendor-entangled", default="",
                            help="Comma-separated entanglements, e.g. docker,bittensor.")
     build_cmd.add_argument("--parity-json", default=None,
@@ -255,7 +265,7 @@ def _git_rev(path: Path) -> str:
 
 def _derive_spec(args: argparse.Namespace):
     """Fill in pack/evaluator/subnet from whatever the operator did supply."""
-    from kata_forge.spec import SubnetSpec
+    from kata_forge.spec import validate_spec
     from kata_forge.trusted_input import parse_canonical_github_url
 
     subnet = args.subnet
@@ -263,15 +273,23 @@ def _derive_spec(args: argparse.Namespace):
     if pack:
         subnet = subnet or _subnet_from_pack(pack)
     if subnet is None:
-        raise ValueError("pass --subnet, or a --pack of the form sn<N>__<slug>")
+        raise ValueError(
+            "a repository URL cannot securely reveal its subnet number; pass --subnet N, "
+            "--pack sn<N>__<slug>, or use --subnet N --catalog FILE without --repo"
+        )
     if not pack:
         slug = (parse_canonical_github_url(args.repo).repo.lower().replace("-", "_")
                 if args.repo else f"sn{subnet}")
         pack = f"sn{subnet}__{slug}"
     if not evaluator:
         evaluator = pack.replace("__", "_")
-    return SubnetSpec(subnet_number=subnet, pack=pack, evaluator_id=evaluator,
-                      mode=args.mode, name=args.name)
+    return validate_spec(
+        subnet_number=subnet,
+        pack=pack,
+        evaluator_id=evaluator,
+        mode=args.mode,
+        name=args.name,
+    )
 
 
 def _handle_build(args: argparse.Namespace) -> int:
@@ -310,6 +328,7 @@ def _handle_build(args: argparse.Namespace) -> int:
             source_repo=args.source_repo,
             plugin_source=args.plugin_src,
             vendor_closure_files=args.vendor_closure_files,
+            vendor_files=list(args.vendor_file or []),
             vendor_entangled=[v for v in args.vendor_entangled.split(",") if v.strip()],
             parity=parity,
         )
@@ -372,6 +391,9 @@ def _handle_decide(args: argparse.Namespace) -> int:
     from kata_forge.trusted_input import TrustedInputError
 
     try:
+        import json
+
+        parity = json.loads(Path(args.parity_json).read_text()) if args.parity_json else None
         result = run_decision_pipeline(
             repo=args.repo,
             subnet=args.subnet,
@@ -380,8 +402,12 @@ def _handle_decide(args: argparse.Namespace) -> int:
             out_dir=args.out,
             commit=args.commit,
             allow_gpu=args.allow_gpu,
+            vendor_closure_files=args.vendor_closure_files,
+            vendor_files=list(args.vendor_file or []),
+            vendor_entangled=[v.strip() for v in args.vendor_entangled.split(",") if v.strip()],
+            parity=parity,
         )
-    except (TrustedInputError, PinnedFetchError) as error:
+    except (TrustedInputError, PinnedFetchError, OSError, ValueError) as error:
         # No record is written: without a canonical, pinned source there is nothing to record ABOUT.
         print(f"kata-forge: REFUSE / NEEDS-HUMAN: {error}", file=sys.stderr)
         return 2

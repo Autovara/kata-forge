@@ -27,18 +27,24 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from kata_forge.compartment import VERIFY, CompartmentUnavailable, fresh_workspace, run_in_compartment
-from kata_forge.decision import CLONE, REFUSE, DecisionInputs, decide, write_decision_record
-from kata_forge.onboard import INTEGRATION_DECISION_FILENAME
+from kata_forge.compartment import (
+    VERIFY,
+    CompartmentUnavailable,
+    fresh_workspace,
+    run_in_compartment,
+)
 from kata_forge.cost import estimate_cost
+from kata_forge.decision import CLONE, REFUSE, VENDOR, DecisionInputs, decide, write_decision_record
 from kata_forge.deps import classify_repo
 from kata_forge.license_gate import detect_license
+from kata_forge.onboard import INTEGRATION_DECISION_FILENAME
 from kata_forge.pinned_fetch import compartment_git_runner, fetch_pinned
 from kata_forge.redaction import scan_embedded_secrets
 from kata_forge.trusted_input import (
@@ -66,6 +72,9 @@ STATES = ("researching", "drafting", "verifying", "verified", "refused", "failed
 #: Paths a build output root may never live under: writing build intermediates into live state is
 #: precisely the "build is not deployment" boundary this command exists to hold.
 _FORBIDDEN_ROOTS = ("/srv", "/etc", "/usr", "/boot", "/var/lib")
+_SOURCE_REPO_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
 
 
 class BuildError(Exception):
@@ -85,6 +94,17 @@ class BuildInputs:
     kata_rev: str
     kata_bot_rev: str
     kata_forge_rev: str
+    subnet_id: int = 0
+    pack: str = ""
+    evaluator: str = ""
+    mode: str = ""
+    source_repo: str = ""
+    kata_tree_hash: str = ""
+    plugin_contract_version: int = 0
+    plugin_source_sha256: str = ""
+    decision_inputs_sha256: str = ""
+    build_tools_sha256: str = ""
+    ai_config_sha256: str = ""
     policy_version: str = POLICY_VERSION
     attempt_nonce: str = "1"
 
@@ -95,6 +115,17 @@ class BuildInputs:
             "kata_rev": self.kata_rev,
             "kata_bot_rev": self.kata_bot_rev,
             "kata_forge_rev": self.kata_forge_rev,
+            "subnet_id": self.subnet_id,
+            "pack": self.pack,
+            "evaluator": self.evaluator,
+            "mode": self.mode,
+            "source_repo": self.source_repo,
+            "kata_tree_hash": self.kata_tree_hash,
+            "plugin_contract_version": self.plugin_contract_version,
+            "plugin_source_sha256": self.plugin_source_sha256,
+            "decision_inputs_sha256": self.decision_inputs_sha256,
+            "build_tools_sha256": self.build_tools_sha256,
+            "ai_config_sha256": self.ai_config_sha256,
             "policy_version": self.policy_version,
             "attempt_nonce": self.attempt_nonce,
         }
@@ -145,7 +176,9 @@ class BuildState:
     plugin_contract_version: int = 0
     evaluator_id: str = ""
     kata_tree_hash: str = ""
-    conformance: str = "not-run"
+    integration_mode: str = ""
+    forge_verification: str = "not-run"
+    conformance: str = "pending-installer"
     #: Methods still unwritten. A non-empty list is an honest UNRESOLVED build: emitted
     #: for review, but refused by the trusted installer.
     unresolved_methods: list = None
@@ -162,6 +195,8 @@ class BuildState:
             "plugin_contract_version": self.plugin_contract_version,
             "evaluator_id": self.evaluator_id,
             "kata_tree_hash": self.kata_tree_hash,
+            "integration_mode": self.integration_mode,
+            "forge_verification": self.forge_verification,
             "conformance": self.conformance,
             "unresolved_methods": sorted(self.unresolved_methods or []),
         }
@@ -184,6 +219,161 @@ def _fsync_write(path: Path, body: str) -> None:
 
 def _canonical_json(document: dict) -> str:
     return json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+
+
+_SOURCE_EXCLUDES = frozenset({
+    ".git",
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    "dist",
+})
+
+
+def _source_tree_digest(root: str | Path | None, *, allow_symlinks: bool = False) -> str:
+    """Content identity for a caller-supplied plugin/tool tree.
+
+    A path string is not an input identity: the bytes at that path can change between retries. The
+    digest covers relative path, mode and content, rejects symlinks/special files, and ignores only
+    reproducible build/cache debris. It is used in ``BuildInputs`` so editing a completed plugin or
+    the offline build toolchain can never silently reuse an older bundle.
+    """
+    if root is None:
+        return "generated"
+    base = Path(root).expanduser().resolve()
+    if not base.is_dir():
+        raise BuildError(f"input tree is not a directory: {base}")
+    digest = hashlib.sha256()
+    for path in sorted(base.rglob("*")):
+        rel_path = path.relative_to(base)
+        if any(part in _SOURCE_EXCLUDES for part in rel_path.parts):
+            continue
+        if path.is_symlink():
+            if not allow_symlinks:
+                raise BuildError(f"symlink in input tree (refused): {path}")
+            rel = str(rel_path).replace(os.sep, "/")
+            digest.update(rel.encode("utf-8"))
+            digest.update(b"\0link\0")
+            digest.update(os.readlink(path).encode("utf-8"))
+            digest.update(b"\n")
+            continue
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise BuildError(f"special file in input tree (refused): {path}")
+        rel = str(rel_path).replace(os.sep, "/")
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(f"{path.stat().st_mode & 0o777:o}".encode("ascii"))
+        digest.update(b"\0")
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 16), b""):
+                digest.update(chunk)
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _canonical_digest(document: object) -> str:
+    body = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _safe_source_relpath(value: str) -> str:
+    rel = PurePosixPath(str(value))
+    if rel.is_absolute() or not rel.parts or any(part in ("", ".", "..") for part in rel.parts):
+        raise BuildError(f"unsafe source-relative path: {value!r}")
+    return rel.as_posix()
+
+
+def _regular_source_file(source_root: Path, rel: str) -> Path:
+    safe = _safe_source_relpath(rel)
+    candidate = source_root.joinpath(*PurePosixPath(safe).parts)
+    if candidate.is_symlink() or not candidate.is_file():
+        raise BuildError(f"vendored source is missing, a symlink, or not regular: {safe}")
+    resolved = candidate.resolve()
+    if source_root.resolve() not in resolved.parents:
+        raise BuildError(f"vendored source escapes the pinned tree: {safe}")
+    return candidate
+
+
+def _resolve_vendor_files(
+    source_root: Path,
+    requested: list[str] | None,
+) -> list[str]:
+    """Return the exact closure that will be copied for a VENDOR decision.
+
+    A closure is evidence only when the operator names every file. Inferring it from ``*.py`` is not
+    conservative: a tiny scorer may still require JSON, templates, native data, or another non-Python
+    artifact. A numeric count or an inferred language subset cannot identify the bytes.
+    """
+    if requested:
+        files = sorted({_safe_source_relpath(item) for item in requested})
+    else:
+        files = []
+    for rel in files:
+        _regular_source_file(source_root, rel)
+    return files
+
+
+def _copy_vendor_closure(
+    source_root: Path,
+    plugin_tree: Path,
+    package: str,
+    files: list[str],
+    *,
+    source_url: str,
+    source_commit: str,
+) -> str:
+    if not files:
+        raise BuildError(
+            "VENDOR selected without exact source files; pass --vendor-file for every closure file"
+        )
+    vendor_root = plugin_tree / package / "vendor_upstream"
+    records = []
+    for rel in files:
+        source = _regular_source_file(source_root, rel)
+        target = vendor_root.joinpath(*PurePosixPath(rel).parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        records.append({
+            "source": rel,
+            "packaged": str(target.relative_to(plugin_tree)).replace(os.sep, "/"),
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        })
+    pin = vendor_root / "PINNED.json"
+    pin.write_text(
+        _canonical_json({
+            "schema_version": 1,
+            "source_url": source_url,
+            "source_commit": source_commit,
+            "files": records,
+        }),
+        encoding="utf-8",
+    )
+    return str(pin.relative_to(plugin_tree)).replace(os.sep, "/")
+
+
+def _copy_clone_snapshot(source_root: Path, staging: Path, repo_name: str) -> str:
+    """Copy a pinned worktree into the bundle, rejecting symlinks and special files."""
+    root = staging / "upstream" / repo_name
+    for source in sorted(source_root.rglob("*")):
+        rel = source.relative_to(source_root)
+        if rel.parts and rel.parts[0] == ".git":
+            continue
+        if source.is_symlink():
+            raise BuildError(f"symlink in CLONE snapshot (refused): {rel}")
+        target = root / rel
+        if source.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif source.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        else:
+            raise BuildError(f"special file in CLONE snapshot (refused): {rel}")
+    if not root.is_dir() or not any(path.is_file() for path in root.rglob("*")):
+        raise BuildError("CLONE snapshot is empty")
+    return str(root.relative_to(staging)).replace(os.sep, "/")
 
 
 def write_build_state(root: Path, state: BuildState) -> None:
@@ -245,27 +435,47 @@ def read_unresolved_methods(plugin_tree: Path) -> list[str]:
 
 
 
-def _draft_unresolved(plugin_tree: Path, methods: list[str], spec, staging: Path):
+def _draft_unresolved(
+    plugin_tree: Path,
+    methods: list[str],
+    spec,
+    staging: Path,
+    build_id: str,
+    *,
+    drafter=None,
+    verifier=None,
+):
     """Run the bounded draft loop, or return None when AI drafting is not configured.
 
     Not configuring it is the normal case and not an error: the build proceeds with anchored stubs
     and reports them honestly.
     """
-    from kata_forge.ai_budget import AiBudget, AiDraftingDisabled, AiUsage, limits_from_env, write_ai_usage
+    from kata_forge.ai_budget import (
+        AiBudget,
+        AiDraftingDisabled,
+        AiUsage,
+        limits_from_env,
+        write_ai_usage,
+    )
     from kata_forge.draft_loop import run_draft_loop
 
     try:
         limits = limits_from_env()
     except AiDraftingDisabled:
         return None
-    drafter = _load_drafter()
+    drafter = drafter or _load_drafter()
     if drafter is None:
         return None
+    if verifier is None:
+        # Syntax parsing is useful feedback, but it is not evidence that score/run_candidate or
+        # benchmark semantics work. Do not spend a model call when no authoritative subnet fixture
+        # can decide whether to accept its output.
+        return None
 
-    usage = AiUsage(build_id=staging.name, provider=os.environ.get("KATA_FORGE_LLM", "unknown"),
+    usage = AiUsage(build_id=build_id, provider=os.environ.get("KATA_FORGE_LLM", "unknown"),
                     model=os.environ.get("KATA_FORGE_AI_MODEL", "unknown"), limits=limits)
     outcome = run_draft_loop(plugin_tree, methods=list(methods), pack=spec.pack,
-                             budget=AiBudget(limits, usage), drafter=drafter)
+                             budget=AiBudget(limits, usage), drafter=drafter, verify=verifier)
     # Provenance is written even when nothing was drafted: "we tried and it cost this" is exactly
     # what a reviewer needs to see.
     write_ai_usage(staging / "ai-usage.json", usage)
@@ -273,18 +483,81 @@ def _draft_unresolved(plugin_tree: Path, methods: list[str], spec, staging: Path
 
 
 def _load_drafter():
-    """The configured drafter, or None. The forge ships no provider client by design -- a deployment
-    supplies one, and until it does, drafting is off."""
-    target = (os.environ.get("KATA_FORGE_DRAFTER") or "").strip()
-    if not target or ":" not in target:
-        return None
-    module_name, _, attribute = target.partition(":")
-    import importlib
+    """Return the configured compartment command drafter, or ``None``.
 
-    try:
-        return getattr(importlib.import_module(module_name), attribute)
-    except (ImportError, AttributeError):
+    The old seam imported ``module:function`` and called it in the forge process. That meant the
+    model/provider client inherited the operator's filesystem, environment and network even though
+    the parse check ran in a namespace. The production seam is now an argv JSON array. The command
+    runs inside DRAFT (no network, clean environment, no home) and receives two final arguments:
+    ``request.json`` and ``response.py``.
+
+    A Python callable may still be injected directly into :func:`build` by unit tests; the CLI never
+    exposes that seam.
+    """
+    raw = (os.environ.get("KATA_FORGE_DRAFTER_ARGV_JSON") or "").strip()
+    if not raw:
         return None
+    try:
+        argv = json.loads(raw)
+    except ValueError as exc:
+        raise BuildError(f"KATA_FORGE_DRAFTER_ARGV_JSON is invalid JSON: {exc}") from exc
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or any(not isinstance(item, str) or not item for item in argv)
+    ):
+        raise BuildError("KATA_FORGE_DRAFTER_ARGV_JSON must be a non-empty JSON string array")
+    declared_executable = Path(argv[0])
+    if not declared_executable.is_absolute():
+        raise BuildError("the Draft command must be an absolute executable under /usr or /bin")
+    try:
+        executable = declared_executable.resolve(strict=True)
+    except OSError as exc:
+        raise BuildError(f"the Draft command does not resolve to an executable: {exc}") from exc
+    usr = Path("/usr").resolve()
+    bin_dir = Path("/bin").resolve()
+    if (
+        not executable.is_file()
+        or not os.access(executable, os.X_OK)
+        or not any(executable == root or root in executable.parents for root in (usr, bin_dir))
+    ):
+        raise BuildError("the Draft command must resolve to an executable under /usr or /bin")
+    # Run the canonical target. A spelling such as /usr/../tmp/tool must never pass the prefix check
+    # and then execute from the writable workspace inside the namespace.
+    argv[0] = str(executable)
+
+    from kata_forge.compartment import DRAFT
+
+    def _draft(method: str, prompt: str) -> str:
+        scratch = _compartment_scratch()
+        workspace = fresh_workspace(scratch, "draft")
+        request = workspace / "request.json"
+        response = workspace / "response.py"
+        request.write_text(
+            json.dumps({"schema_version": 1, "method": method, "prompt": prompt}),
+            encoding="utf-8",
+        )
+        try:
+            run = run_in_compartment(
+                DRAFT,
+                [*argv, str(request), str(response)],
+                workspace=workspace,
+            )
+        except CompartmentUnavailable as exc:
+            raise BuildError(f"Draft compartment unavailable: {exc}") from exc
+        if run.returncode != 0:
+            raise BuildError(
+                f"Draft command failed for {method}: {(run.stderr or run.stdout).strip()[:800]}"
+            )
+        try:
+            body = response.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise BuildError(f"Draft command produced no response for {method}: {exc}") from exc
+        if not body.strip():
+            raise BuildError(f"Draft command produced an empty response for {method}")
+        return body
+
+    return _draft
 
 
 
@@ -394,12 +667,20 @@ class BuildResult:
     reused: bool = False
     artifacts: list[str] = field(default_factory=list)
     unresolved_methods: list[str] = field(default_factory=list)
+    forge_verification: str = "not-run"
+    conformance: str = "pending-installer"
 
     @property
     def installable(self) -> bool:
-        """Only a bundle that reached ``verified`` with NO unwritten method may be staged. An
-        UNRESOLVED build is a legitimate, reviewable output -- it is just never a deployment."""
-        return self.state == "verified" and not self.unresolved_methods
+        """Only a bundle that reached forge verification with NO unwritten method may enter the
+        trusted installer. Authoritative candidate-runtime conformance remains an installer gate.
+        An UNRESOLVED build is a legitimate, reviewable output -- it is never deployable."""
+        return (
+            self.state == "verified"
+            and not self.unresolved_methods
+            and self.forge_verification == "passed"
+            and self.conformance == "pending-installer"
+        )
 
 
 def _phase_dir(output_root: Path, build_id: str) -> Path:
@@ -459,6 +740,47 @@ def _write_release_manifest(root: Path, *, abi: dict, plugin: dict, registry_cha
     return manifest
 
 
+def _verify_existing_build(root: Path, expected_build_id: str) -> dict:
+    """Recompute an immutable prior result before treating it as an idempotent hit."""
+    state = read_build_state(root)
+    if not isinstance(state, dict):
+        raise BuildError(f"existing build {root} has no valid {BUILD_STATE_FILENAME}")
+    if state.get("build_id") != expected_build_id:
+        raise BuildError(
+            f"existing build id mismatch: directory {expected_build_id}, "
+            f"state {state.get('build_id')!r}"
+        )
+    if state.get("state") != "verified":
+        # A refusal intentionally has no release manifest/tree digest, so its evidence has no
+        # immutable envelope we can recompute. Reusing it on the strength of build-state.json alone
+        # would let accidental/tampered bytes masquerade as the prior policy result. Keep the record
+        # for review, but require an explicit new attempt to execute the policy again.
+        raise BuildError(
+            f"existing build {root} is {state.get('state')!r} and has no verifiable release "
+            "manifest; inspect it or use --new-attempt"
+        )
+    try:
+        manifest = json.loads((root / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BuildError(f"existing verified build has no valid manifest: {exc}") from exc
+    declared_tree = manifest.get("tree_manifest")
+    if not isinstance(declared_tree, dict):
+        raise BuildError("existing verified build manifest has no tree_manifest")
+    actual_tree = _tree_manifest(root, exclude={MANIFEST_FILENAME})
+    if actual_tree != declared_tree:
+        raise BuildError("existing build tree differs from its manifest; refusing reuse")
+    payload = {key: value for key, value in manifest.items() if key != "bundle_digest"}
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        + json.dumps(actual_tree, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if manifest.get("bundle_digest") != digest:
+        raise BuildError("existing build bundle digest is invalid; refusing reuse")
+    return state
+
+
 def build(
     *,
     output_root: str | Path,
@@ -478,9 +800,12 @@ def build(
     wheel_builder=None,
     vendor_closure_files: int | None = None,
     vendor_entangled: list[str] | None = None,
+    vendor_files: list[str] | None = None,
     parity: dict | None = None,
     plugin_source: str | Path | None = None,
     source_repo: str = "",
+    drafter=None,
+    draft_verifier=None,
 ) -> BuildResult:
     """Run the whole chain and emit one immutable bundle. Never writes live state.
 
@@ -489,12 +814,54 @@ def build(
     """
     # 0 PREFLIGHT -- the cheapest refusals first, before anything is fetched or written.
     root = validate_output_root(output_root)
+    from kata_forge.spec import validate_spec
+
+    # ``build`` is a public Python seam as well as a CLI handler. Do not trust a caller to have
+    # obtained its dataclass through the validating constructor.
+    spec = validate_spec(
+        subnet_number=spec.subnet_number,
+        pack=spec.pack,
+        evaluator_id=spec.evaluator_id,
+        mode=spec.mode,
+        name=spec.name,
+    )
     # source_repo is the Kata repo whose PRs route to this lane. kata-bot requires it, so a build
     # without one produces a registry the resident refuses to parse: catch it here, not at install.
-    if not str(source_repo or "").strip():
+    source_repo = str(source_repo or "").strip()
+    if not source_repo:
         raise BuildError(
             "--source-repo is required: it is the Kata repo whose PRs route to this lane, and "
             "kata-bot refuses a registry lane without one")
+    if not _SOURCE_REPO_RE.fullmatch(source_repo):
+        raise BuildError("--source-repo must be an owner/repo slug")
+    plugin_source_digest = _source_tree_digest(plugin_source)
+    build_tools_digest = (
+        "injected-wheel-builder"
+        if wheel_builder is not None
+        else _source_tree_digest(BUILD_TOOLS_ENV, allow_symlinks=True)
+    )
+    decision_inputs_digest = _canonical_digest({
+        "allow_gpu": bool(allow_gpu),
+        "vendor_closure_files": vendor_closure_files,
+        "vendor_entangled": sorted(vendor_entangled or []),
+        "vendor_files": sorted(vendor_files or []),
+        "parity": parity or {},
+    })
+    ai_config_digest = _canonical_digest({
+        "provider": os.environ.get("KATA_FORGE_LLM", ""),
+        "model": os.environ.get("KATA_FORGE_AI_MODEL", ""),
+        "max_attempts": os.environ.get("KATA_FORGE_AI_MAX_ATTEMPTS", ""),
+        "max_wall_seconds": os.environ.get("KATA_FORGE_AI_MAX_WALL_SECONDS", ""),
+        "max_input_bytes": os.environ.get("KATA_FORGE_AI_MAX_INPUT_BYTES", ""),
+        "max_output_tokens": os.environ.get("KATA_FORGE_AI_MAX_OUTPUT_TOKENS", ""),
+        "max_spend_usd": os.environ.get("KATA_FORGE_AI_MAX_SPEND_USD", ""),
+        "provider_enforces_spend": os.environ.get(
+            "KATA_FORGE_AI_PROVIDER_ENFORCES_SPEND", ""
+        ),
+        "drafter_argv": os.environ.get("KATA_FORGE_DRAFTER_ARGV_JSON", ""),
+        "drafter_injected_for_test": drafter is not None,
+        "authoritative_verifier_injected_for_test": draft_verifier is not None,
+    })
 
     # 1 RESOLVE + 2 FETCH. The commit is part of the build identity, so it must be known before the
     # build id exists; a retry therefore re-resolves but does not re-emit.
@@ -521,6 +888,17 @@ def build(
         kata_rev=kata_rev,
         kata_bot_rev=kata_bot_rev,
         kata_forge_rev=kata_forge_rev,
+        subnet_id=int(spec.subnet_number),
+        pack=str(spec.pack),
+        evaluator=str(spec.evaluator_id),
+        mode=str(spec.mode),
+        source_repo=source_repo,
+        kata_tree_hash=kata_tree_hash,
+        plugin_contract_version=int(plugin_contract_version),
+        plugin_source_sha256=plugin_source_digest,
+        decision_inputs_sha256=decision_inputs_digest,
+        build_tools_sha256=build_tools_digest,
+        ai_config_sha256=ai_config_digest,
         attempt_nonce=os.urandom(8).hex() if new_attempt else "1",
     )
     build_id = inputs.build_id()
@@ -529,12 +907,18 @@ def build(
     # IDEMPOTENCE: an identical input resolves to an identical id. Re-emitting would spend again and
     # could produce a different bundle from the one already reviewed, so the prior result is returned.
     if final.is_dir():
-        prior = read_build_state(final) or {}
-        return BuildResult(build_id=build_id, bundle_dir=final,
-                           state=str(prior.get("state") or "failed"),
-                           mode=str(prior.get("mode") or ""),
-                           reason="existing build for identical inputs; use --new-attempt to rebuild",
-                           reused=True)
+        prior = _verify_existing_build(final, build_id)
+        return BuildResult(
+            build_id=build_id,
+            bundle_dir=final,
+            state=str(prior.get("state") or "failed"),
+            mode=str(prior.get("integration_mode") or ""),
+            reason="existing build for identical inputs; use --new-attempt to rebuild",
+            reused=True,
+            unresolved_methods=list(prior.get("unresolved_methods") or []),
+            forge_verification=str(prior.get("forge_verification") or "not-run"),
+            conformance=str(prior.get("conformance") or "pending-installer"),
+        )
 
     staging = _staging_dir(root, build_id)
     shutil.rmtree(staging, ignore_errors=True)
@@ -550,7 +934,10 @@ def build(
         # so the S4 installer has nothing to verify and cannot promote it.
         os.replace(staging, final)
         return BuildResult(build_id=build_id, bundle_dir=final, state="refused", mode=REFUSE,
-                           reason=reason)
+                           reason=reason,
+                           unresolved_methods=list(state.unresolved_methods or []),
+                           forge_verification=state.forge_verification,
+                           conformance=state.conformance)
 
     def _fail(exc: BaseException) -> None:
         """Record an UNEXPECTED failure durably before re-raising.
@@ -568,9 +955,9 @@ def build(
     try:
         return _run_phases(staging, final, state, spec, pinned, inputs, build_id,
                           _refuse, wheel_builder, allow_gpu, vendor_closure_files,
-                          vendor_entangled, parity, kata_rev, kata_forge_rev,
+                          vendor_entangled, vendor_files, parity, kata_rev,
                           kata_tree_hash, plugin_contract_version, plugin_source,
-                          source_repo)
+                          source_repo, drafter, draft_verifier)
     except (BuildError, TrustedInputError):
         raise
     except BaseException as exc:
@@ -579,9 +966,9 @@ def build(
 
 
 def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, wheel_builder,
-                allow_gpu, vendor_closure_files, vendor_entangled, parity, kata_rev,
-                kata_forge_rev, kata_tree_hash, plugin_contract_version,
-                plugin_source=None, source_repo="") -> BuildResult:
+                allow_gpu, vendor_closure_files, vendor_entangled, vendor_files, parity, kata_rev,
+                kata_tree_hash, plugin_contract_version, plugin_source=None, source_repo="",
+                drafter=None, draft_verifier=None) -> BuildResult:
     # 3 RESEARCH -- the credential scan first, so a leak stops the build before any AI input.
     state.phase = "research"
     write_build_state(staging, state)
@@ -589,18 +976,30 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
     deps = classify_repo(pinned.path)
     cost = estimate_cost(pinned.path, deps=deps)
     licence = detect_license(pinned.path)
+    exact_vendor_files = _resolve_vendor_files(
+        pinned.path,
+        vendor_files,
+    )
+    effective_vendor_count = (
+        vendor_closure_files
+        if vendor_closure_files is not None
+        else (len(exact_vendor_files) if exact_vendor_files else None)
+    )
 
     # 4 FREE GATE + 5 DECIDE
     decision = decide(DecisionInputs(
         source_url=pinned.url, source_commit=pinned.commit, dep_verdict=deps.verdict,
         cost_class=cost.cost_class, needs_gpu=cost.needs_gpu, embedded_secrets=embedded,
-        license=licence.as_evidence(), vendor_closure_files=vendor_closure_files,
+        license=licence.as_evidence(), vendor_closure_files=effective_vendor_count,
+        vendor_files=exact_vendor_files,
         vendor_entangled=list(vendor_entangled or []), parity=dict(parity or {}),
         allow_gpu=allow_gpu,
     ))
     write_decision_record(staging / INTEGRATION_DECISION_FILENAME, decision)
     if decision.mode == REFUSE:
         return _refuse("; ".join(decision.reasons), "decide")
+    state.integration_mode = decision.mode
+    write_build_state(staging, state)
 
     # 6 SCAFFOLD -- the plugin, written only inside staging.
     state.state, state.phase = "drafting", "scaffold"
@@ -632,14 +1031,52 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
     if state.unresolved_methods:
         state.state, state.phase = "drafting", "draft"
         write_build_state(staging, state)
-        draft = _draft_unresolved(plugin_tree, state.unresolved_methods, spec, staging)
+        draft = _draft_unresolved(
+            plugin_tree,
+            state.unresolved_methods,
+            spec,
+            staging,
+            build_id,
+            drafter=drafter,
+            verifier=draft_verifier,
+        )
         if draft is not None:
             state.unresolved_methods = draft.unresolved
             _fsync_write(staging / "ai-draft.json",
                          _canonical_json(draft.as_evidence()))
             write_build_state(staging, state)
 
-    # 7-8 INTEGRATE + verify. The wheel is built in the Verify compartment: a build backend is
+    # 7 INTEGRATE. The selected policy outcome now changes actual bundle bytes, not only a label in
+    # integration-decision.json. VENDOR copies the exact measured closure into the plugin package;
+    # CLONE retains the complete pinned worktree (minus .git) for deterministic trusted promotion.
+    if decision.mode == VENDOR:
+        vendor_pin = _copy_vendor_closure(
+            pinned.path,
+            plugin_tree,
+            spec.package,
+            exact_vendor_files,
+            source_url=pinned.url,
+            source_commit=pinned.commit,
+        )
+        integration = {
+            "mode": "vendor",
+            "source_url": pinned.url,
+            "source_commit": pinned.commit,
+            "vendor_manifest": f"plugin/{spec.repo_name}/{vendor_pin}",
+        }
+    elif decision.mode == CLONE:
+        clone_root = _copy_clone_snapshot(pinned.path, staging, pinned.path.name)
+        integration = {
+            "mode": "clone",
+            "source_url": pinned.url,
+            "source_commit": pinned.commit,
+            "tree_root": clone_root,
+            "install_path": f"/srv/kata-sn{spec.subnet_number}-upstream",
+        }
+    else:  # fixed policy currently has only these two non-refusal outcomes
+        return _refuse(f"unsupported integration mode {decision.mode!r}", "integrate")
+
+    # 8 verify. The wheel is built in the Verify compartment: a build backend is
     # untrusted code and must not run on the build host.
     state.state, state.phase = "verifying", "wheel"
     write_build_state(staging, state)
@@ -657,12 +1094,19 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
     _fsync_write(staging / SBOM_FILENAME,
                  _canonical_json(build_sbom(pinned.path, pinned.url, pinned.commit)))
 
-    # CONFORMANCE. Only ever recorded as passed when it was actually RUN. The forge cannot execute
-    # the installer's clean-venv check (that needs the candidate runtime, which only the trusted
-    # installer builds), so what it can honestly assert is narrower: the plugin imports and its
-    # declared entry point resolves, verified in the VERIFY compartment. Anything it did not run is
-    # recorded as `not-run`, and the installer re-verifies from scratch regardless.
-    state.conformance = _run_plugin_smoke_check(plugin_tree, _compartment_scratch())
+    # FORGE VERIFICATION is narrower than authoritative runtime conformance: it proves the entry
+    # point exists and every module parses inside VERIFY. The trusted installer builds the candidate
+    # runtime and performs entry-point/ABI/decision/core conformance later. Keep the states distinct
+    # so the bundle never claims that forge ran a test it could not run.
+    state.forge_verification = _run_plugin_smoke_check(
+        plugin_tree, _compartment_scratch()
+    )
+    if state.forge_verification != "passed":
+        return _refuse(
+            f"plugin verification was {state.forge_verification}; refusing an unverified bundle",
+            "conformance",
+        )
+    state.conformance = "pending-installer"
     state.state, state.phase = "verified", "emit"
     write_build_state(staging, state)
 
@@ -692,10 +1136,13 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
     if decision.mode == CLONE:
         lane["upstream_repo"] = pinned.url
         lane["upstream_commit"] = pinned.commit
+        lane["challenge_config"] = {
+            "upstream_path": f"/srv/kata-sn{spec.subnet_number}-upstream"
+        }
     manifest = _write_release_manifest(
         staging,
         abi={"plugin_contract_version": plugin_contract_version, "kata_tree_hash": kata_tree_hash,
-             "kata_rev": kata_rev, "plugin_rev": kata_forge_rev},
+             "kata_rev": kata_rev, "plugin_rev": _source_tree_digest(plugin_tree)},
         plugin={"subnet_id": spec.subnet_number,
                 "tree_root": f"plugin/{spec.repo_name}",
                 "evaluator_id": spec.evaluator_id,
@@ -704,6 +1151,7 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
         registry_change={"lane": lane, "lane_env": {}},
         unit_params={"timeout_start_sec": 5400, "round_gap_sec": 180, "requires_docker": True},
         extra={"build_inputs": inputs.canonical(), "sbom": SBOM_FILENAME,
+               "integration": integration,
                "decision": INTEGRATION_DECISION_FILENAME},
     )
 
@@ -713,6 +1161,8 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
     return BuildResult(build_id=build_id, bundle_dir=final, state="verified", mode=decision.mode,
                        artifacts=sorted(manifest["tree_manifest"]),
                        unresolved_methods=list(state.unresolved_methods or []),
+                       forge_verification=state.forge_verification,
+                       conformance=state.conformance,
                        reason=("methods still UNRESOLVED: "
                                + ", ".join(state.unresolved_methods or [])
                                if state.unresolved_methods else ""))

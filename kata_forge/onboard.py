@@ -25,7 +25,7 @@ from kata_forge.cost import estimate_cost
 from kata_forge.decision import DecisionInputs, IntegrationDecision, decide, write_decision_record
 from kata_forge.deps import classify_repo
 from kata_forge.license_gate import detect_license
-from kata_forge.pinned_fetch import PinnedSource, fetch_pinned
+from kata_forge.pinned_fetch import PinnedSource, compartment_git_runner, fetch_pinned
 from kata_forge.redaction import scan_embedded_secrets
 from kata_forge.trusted_input import CanonicalRepo, resolve_trusted_input
 
@@ -52,13 +52,25 @@ def run_decision_pipeline(
     allow_gpu: bool = False,
     git_runner=None,
     vendor_closure_files: int | None = None,
+    vendor_files: list[str] | None = None,
     vendor_entangled: list[str] | None = None,
     parity: dict | None = None,
 ) -> OnboardResult:
     """Resolve, fetch, research and decide. Writes ``integration-decision.json`` for EVERY outcome."""
     canonical = resolve_trusted_input(repo=repo, subnet=subnet, catalog_path=catalog_path)
-    pinned = fetch_pinned(canonical, Path(work_dir) / f"{canonical.owner}__{canonical.repo}",
-                          commit=commit, git_runner=git_runner)
+    from kata_forge.compartment import fresh_workspace
+
+    # `decide` is a production path too: it must not quietly use fetch_pinned's development-only
+    # host runner while `build` uses the namespace. One disposable workspace is the Fetch
+    # compartment's sole writable surface; a test may still inject a deterministic runner.
+    fetch_workspace = fresh_workspace(work_dir, "fetch")
+    runner = git_runner or compartment_git_runner(fetch_workspace)
+    pinned = fetch_pinned(
+        canonical,
+        fetch_workspace / f"{canonical.owner}__{canonical.repo}",
+        commit=commit,
+        git_runner=runner,
+    )
 
     # RESEARCH. The credential scan runs FIRST among the analyses because its finding is the one that
     # must stop the pipeline before any source text could reach a model provider.
@@ -76,6 +88,7 @@ def run_decision_pipeline(
         embedded_secrets=embedded,
         license=license_finding.as_evidence(),
         vendor_closure_files=vendor_closure_files,
+        vendor_files=list(vendor_files or []),
         vendor_entangled=list(vendor_entangled or []),
         parity=dict(parity or {}),
         allow_gpu=allow_gpu,

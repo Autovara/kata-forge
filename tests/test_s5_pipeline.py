@@ -43,8 +43,12 @@ class _ScriptedGit:
 
 
 def _run(tmp_path, files, **over):
-    kwargs = dict(repo=GOOD, work_dir=tmp_path / "work", out_dir=tmp_path / "out",
-                  git_runner=_ScriptedGit(files))
+    kwargs = {
+        "repo": GOOD,
+        "work_dir": tmp_path / "work",
+        "out_dir": tmp_path / "out",
+        "git_runner": _ScriptedGit(files),
+    }
     kwargs.update(over)
     return run_decision_pipeline(**kwargs)
 
@@ -58,7 +62,12 @@ FREE_REPO = {
 
 # ---- the three acceptance outcomes ---------------------------------------------------------------
 def test_a_free_permissive_pure_scorer_decides_vendor(tmp_path):
-    result = _run(tmp_path, FREE_REPO, vendor_closure_files=2)
+    result = _run(
+        tmp_path,
+        FREE_REPO,
+        vendor_closure_files=1,
+        vendor_files=["scorer.py"],
+    )
     assert result.decision.mode == VENDOR
     assert result.pinned.commit == FULL_SHA
     assert result.record_path.name == INTEGRATION_DECISION_FILENAME
@@ -109,7 +118,12 @@ def test_a_copyleft_licence_blocks_vendor_but_clone_still_reachable(tmp_path):
 
 
 def test_the_record_carries_the_full_pinned_provenance(tmp_path):
-    record = json.loads(_run(tmp_path, FREE_REPO, vendor_closure_files=1).record_path.read_text())
+    record = json.loads(_run(
+        tmp_path,
+        FREE_REPO,
+        vendor_closure_files=1,
+        vendor_files=["scorer.py"],
+    ).record_path.read_text())
     source = record["evidence"]["source"]
     assert source["url"] == GOOD and source["commit"] == FULL_SHA
     assert record["evidence"]["license"]["spdx"] == "MIT"

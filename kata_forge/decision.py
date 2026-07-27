@@ -67,6 +67,7 @@ class DecisionInputs:
     license: dict = field(default_factory=dict)
     #: Measured VENDOR proof: the scorer's closure size and entanglement flags.
     vendor_closure_files: int | None = None
+    vendor_files: list[str] = field(default_factory=list)
     vendor_entangled: list[str] = field(default_factory=list)
     #: kata_forge.parity.ParityResult evidence dict.
     parity: dict = field(default_factory=dict)
@@ -125,6 +126,14 @@ def _vendor_proof(inputs: DecisionInputs) -> tuple[bool, list[str]]:
     if closure is None:
         notes.append("no vendor closure was measured")
         return False, notes
+    if not inputs.vendor_files:
+        notes.append("no exact vendor file list was supplied; a count alone does not identify bytes")
+        return False, notes
+    if closure != len(inputs.vendor_files):
+        notes.append(
+            f"vendor closure count {closure} != exact file list length {len(inputs.vendor_files)}"
+        )
+        return False, notes
     if closure > MAX_VENDOR_FILES:
         notes.append(f"scorer closure is {closure} files (> {MAX_VENDOR_FILES}); not a pure-shaped scorer")
         return False, notes
@@ -148,13 +157,17 @@ def _clone_proof(inputs: DecisionInputs) -> tuple[bool, list[str]]:
     cases = int(parity.get("cases_run") or 0)
     mismatches = parity.get("mismatches") or []
     if not executed:
-        return False, [f"parity fixture did not execute ({parity.get('error') or 'not run'}); "
-                       f"a fixture that never ran is not a pass"]
+        return False, [(
+            f"parity fixture did not execute ({parity.get('error') or 'not run'}); "
+            f"a fixture that never ran is not a pass"
+        )]
     if cases <= 0:
         return False, ["parity fixture executed zero cases; comparing nothing always matches"]
     if not matched or mismatches:
-        return False, [f"parity fixture executed {cases} case(s) and disagreed: "
-                       f"{json.dumps(mismatches)[:300]}"]
+        return False, [(
+            f"parity fixture executed {cases} case(s) and disagreed: "
+            f"{json.dumps(mismatches)[:300]}"
+        )]
     return True, [f"parity fixture executed {cases} case(s) and matched"]
 
 
@@ -168,6 +181,7 @@ def decide(inputs: DecisionInputs) -> IntegrationDecision:
         "embedded_secrets": inputs.embedded_secrets,
         "license": inputs.license,
         "vendor": {"closure_files": inputs.vendor_closure_files,
+                   "files": sorted(inputs.vendor_files),
                    "entangled": sorted(inputs.vendor_entangled)},
         "parity": inputs.parity,
         "anchors": sorted(inputs.anchors),
@@ -193,9 +207,14 @@ def decide(inputs: DecisionInputs) -> IntegrationDecision:
 
     return IntegrationDecision(
         mode=REFUSE,
-        reasons=[*vendor_notes, *clone_notes,
-                 "neither a vendor proof nor an executed parity fixture qualified; "
-                 "REFUSE / NEEDS-HUMAN rather than emit a half-working adapter"],
+        reasons=[
+            *vendor_notes,
+            *clone_notes,
+            (
+                "neither a vendor proof nor an executed parity fixture qualified; "
+                "REFUSE / NEEDS-HUMAN rather than emit a half-working adapter"
+            ),
+        ],
         evidence=evidence,
     )
 
