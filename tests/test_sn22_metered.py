@@ -422,3 +422,42 @@ def test_the_gate_and_the_manifest_declaration_share_one_predicate() -> None:
     from kata_forge.decision import requires_metered_approval
 
     assert build_module.requires_metered_approval is requires_metered_approval
+
+
+# ---- an approval must be ENFORCEABLE, not merely recorded ----------------------------------------
+def test_the_approved_ceilings_ship_as_lane_env_caps(paid_build, tmp_path) -> None:
+    """The gap this closes: SN22-0 recorded the approved ceilings but nothing read them at runtime.
+    kata-bot enforces per-day caps from KATA_SUBNET_BUDGET_* in the lane env, so the approval has to
+    arrive there or the lane spends unbounded no matter what the approval says."""
+    from kata_forge.build import MANIFEST_FILENAME
+
+    policy_path = _write_policy(tmp_path, _paid_policy())
+    result = paid_build(metered_policy_path=policy_path)
+    manifest = json.loads((result.bundle_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    lane_env = manifest["registry_change"]["lane_env"]
+    assert lane_env["KATA_SUBNET_BUDGET_SPEND_USD"] == "25.0"
+    assert lane_env["KATA_SUBNET_BUDGET_INFERENCE_CALLS"] == "500.0"
+
+
+def test_a_dimension_the_resident_cannot_meter_is_not_emitted(paid_build, tmp_path) -> None:
+    """data_api_calls may be approved for the record, but there is no enforcement point for it, so
+    emitting a cap would imply a bound that nothing checks."""
+    from kata_forge.build import MANIFEST_FILENAME
+
+    policy_path = _write_policy(tmp_path, _paid_policy())
+    result = paid_build(metered_policy_path=policy_path)
+    manifest = json.loads((result.bundle_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    lane_env = manifest["registry_change"]["lane_env"]
+    assert not any("DATA_API" in key for key in lane_env)
+    assert manifest["integration"]["metered"]["daily_limits"]["data_api_calls"] == 2000.0
+
+
+def test_a_free_build_ships_no_budget_caps(tmp_path) -> None:
+    from kata_forge.build import MANIFEST_FILENAME
+    from tests.test_s7_build import FREE_SOURCE, ScriptedGit, _build
+
+    root = tmp_path / "out"
+    root.mkdir(mode=0o700)
+    result = _build(root, git_runner=ScriptedGit(FREE_SOURCE))
+    manifest = json.loads((result.bundle_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    assert manifest["registry_change"]["lane_env"] == {}

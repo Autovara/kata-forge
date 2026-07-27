@@ -989,6 +989,27 @@ def build(
         raise
 
 
+#: How a budget dimension is spelled in the lane env that kata-bot reads
+#: (``kata_bot.budget.limits_from_env``). Only the dimensions the resident actually enforces: a cap
+#: it never reads would be a limit in name only, and the installer refuses one.
+BUDGET_ENV_FOR_DIMENSION = {
+    "tee_runs": "KATA_SUBNET_BUDGET_TEE_RUNS",
+    "inference_calls": "KATA_SUBNET_BUDGET_INFERENCE_CALLS",
+    "tokens": "KATA_SUBNET_BUDGET_TOKENS",
+    "spend_usd": "KATA_SUBNET_BUDGET_SPEND_USD",
+}
+
+
+def _budget_lane_env(metered_evidence: dict | None) -> dict:
+    """Turn an approval's per-day ceilings into the lane env vars that enforce them."""
+    if not metered_evidence:
+        return {}
+    limits = metered_evidence.get("daily_limits") or {}
+    return {BUDGET_ENV_FOR_DIMENSION[dimension]: str(value)
+            for dimension, value in sorted(limits.items())
+            if dimension in BUDGET_ENV_FOR_DIMENSION}
+
+
 def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, wheel_builder,
                 allow_gpu, vendor_closure_files, vendor_entangled, vendor_files, parity, kata_rev,
                 kata_tree_hash, plugin_contract_version, plugin_source=None, source_repo="",
@@ -1179,6 +1200,10 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
         lane["challenge_config"] = {
             "upstream_path": f"/srv/kata-sn{spec.subnet_number}-upstream"
         }
+    # A metered lane's approved ceilings must ship as caps the resident will actually read before
+    # each paid call, or the approval is a comment. The installer refuses a metered bundle whose
+    # lane_env does not carry them, so emit them from the same approval the gate was decided on.
+    lane_env = _budget_lane_env(metered_evidence)
     manifest = _write_release_manifest(
         staging,
         abi={"plugin_contract_version": plugin_contract_version, "kata_tree_hash": kata_tree_hash,
@@ -1188,7 +1213,7 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
                 "evaluator_id": spec.evaluator_id,
                 "dist_name": spec.repo_name,
                 "wheel": f"dist/{wheel.name}"},
-        registry_change={"lane": lane, "lane_env": {}},
+        registry_change={"lane": lane, "lane_env": lane_env},
         unit_params={"timeout_start_sec": 5400, "round_gap_sec": 180, "requires_docker": True},
         extra={"build_inputs": inputs.canonical(), "sbom": SBOM_FILENAME,
                "integration": integration,
