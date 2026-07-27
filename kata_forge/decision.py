@@ -73,6 +73,12 @@ class DecisionInputs:
     parity: dict = field(default_factory=dict)
     anchors: list[str] = field(default_factory=list)
     allow_gpu: bool = False
+    #: Paid providers the survey actually found (kata_forge.cost). Used to check that a metered
+    #: approval covers reality rather than only what the reviewer expected.
+    paid_providers: list[str] = field(default_factory=list)
+    #: An explicit, reviewed metered approval (kata_forge.metered.MeteredPolicy.as_evidence()).
+    #: ABSENT BY DEFAULT -- without it, a metered validator refuses exactly as before.
+    metered_policy: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -107,16 +113,60 @@ def _input_gates(inputs: DecisionInputs) -> list[str]:
     return reasons
 
 
+def requires_metered_approval(cost_class: str, dep_verdict: str, paid_providers) -> bool:
+    """Whether this survey describes a validator that SPENDS MONEY, and so needs an approval.
+
+    The single predicate for that question. Both the gate below and the bundle's metered declaration
+    derive from it, because two copies of "is this paid?" that drift apart produce the worst possible
+    outcome: a lane the gate treats as paid but the manifest declares as free, or vice versa.
+
+    ``paid_providers`` is part of the test on purpose. Class and verdict alone are not sufficient: a
+    repo whose paid provider is inferred from a credential NAME rather than a dependency can land at
+    ``cost_class=LOW`` / ``dep_verdict=FREE`` while still holding a billable key, and "low" spending
+    is still spending.
+    """
+    return (cost_class in ("METERED", "LOW")
+            or dep_verdict == "NEEDS-KEYS"
+            or bool(paid_providers))
+
+
 def _cost_gates(inputs: DecisionInputs) -> list[str]:
-    """Step 2: the free/GPU gate. Paid validators are out of scope for automation entirely."""
+    """Step 2: the free/GPU gate.
+
+    Free is the DEFAULT and the fallback. A paid validator refuses unless an explicit, reviewed
+    metered policy is supplied AND that policy covers every paid provider the survey actually found.
+    There is no environment variable or flag that relaxes this: the approval must be passed in.
+    """
     reasons: list[str] = []
-    if inputs.cost_class == "METERED" or inputs.dep_verdict == "NEEDS-KEYS":
-        reasons.append(
-            f"validator is not free (cost_class={inputs.cost_class}, deps={inputs.dep_verdict}); "
-            f"paid validators are out of scope for automated onboarding")
+    if requires_metered_approval(inputs.cost_class, inputs.dep_verdict, inputs.paid_providers):
+        allowed, why = _metered_allowed(inputs)
+        if not allowed:
+            reasons.append(
+                f"validator is not free (cost_class={inputs.cost_class}, "
+                f"deps={inputs.dep_verdict}); {why}")
     if inputs.needs_gpu and not inputs.allow_gpu:
         reasons.append("validator requires a GPU; pass --allow-gpu to override explicitly")
     return reasons
+
+
+
+def _metered_allowed(inputs: DecisionInputs) -> tuple[bool, str]:
+    """Whether an explicit metered approval authorises THIS source. Returns (allowed, why-not)."""
+    if not inputs.metered_policy:
+        return False, ("paid validators are out of scope for automated onboarding without an "
+                       "explicit reviewed metered policy")
+    from kata_forge.metered import MeteredPolicyError, parse_metered_policy
+
+    try:
+        policy = parse_metered_policy(inputs.metered_policy)
+    except MeteredPolicyError as exc:
+        return False, f"the supplied metered policy is not valid: {exc}"
+    covered, why = policy.covers(inputs.paid_providers)
+    if not covered:
+        # The approval must cover reality, not only what the reviewer expected. Upstream adding a
+        # provider must invalidate the approval rather than silently ride on it.
+        return False, why
+    return True, ""
 
 
 def _vendor_proof(inputs: DecisionInputs) -> tuple[bool, list[str]]:
@@ -177,7 +227,9 @@ def decide(inputs: DecisionInputs) -> IntegrationDecision:
         "source": {"url": inputs.source_url, "commit": inputs.source_commit},
         "dependencies": {"verdict": inputs.dep_verdict},
         "cost": {"cost_class": inputs.cost_class, "needs_gpu": inputs.needs_gpu,
-                 "allow_gpu": inputs.allow_gpu},
+                 "allow_gpu": inputs.allow_gpu,
+                 "paid_providers": sorted(inputs.paid_providers),
+                 "metered_policy": inputs.metered_policy},
         "embedded_secrets": inputs.embedded_secrets,
         "license": inputs.license,
         "vendor": {"closure_files": inputs.vendor_closure_files,

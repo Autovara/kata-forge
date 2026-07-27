@@ -123,6 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Path to an executed parity fixture result (CLONE evidence).")
     build_cmd.add_argument("--allow-gpu", action="store_true",
                            help="Explicitly permit a GPU-requiring validator.")
+    build_cmd.add_argument(
+        "--metered-policy", default=None,
+        help=("Path to a reviewed metered-approval JSON. Free validators are the default and need "
+              "no policy; a METERED/NEEDS-KEYS source refuses without one."),
+    )
 
     survey = subcommands.add_parser("survey", help="Rank many local repos as onboarding candidates.")
     survey.add_argument("paths", nargs="+", help="Local repo paths to analyze and rank.")
@@ -298,6 +303,7 @@ def _handle_build(args: argparse.Namespace) -> int:
     import os
 
     from kata_forge.build import OUTPUT_ROOT_ENV, BuildError, build
+    from kata_forge.metered import MeteredPolicyError
     from kata_forge.pinned_fetch import PinnedFetchError
     from kata_forge.trusted_input import TrustedInputError
 
@@ -331,8 +337,10 @@ def _handle_build(args: argparse.Namespace) -> int:
             vendor_files=list(args.vendor_file or []),
             vendor_entangled=[v for v in args.vendor_entangled.split(",") if v.strip()],
             parity=parity,
+            metered_policy_path=args.metered_policy,
         )
-    except (TrustedInputError, PinnedFetchError, BuildError, ValueError, OSError) as error:
+    except (TrustedInputError, PinnedFetchError, BuildError, ValueError, OSError,
+            MeteredPolicyError) as error:
         print(f"kata-forge: REFUSE / NEEDS-HUMAN: {error}", file=sys.stderr)
         return 2
 

@@ -41,9 +41,18 @@ from kata_forge.compartment import (
     run_in_compartment,
 )
 from kata_forge.cost import estimate_cost
-from kata_forge.decision import CLONE, REFUSE, VENDOR, DecisionInputs, decide, write_decision_record
+from kata_forge.decision import (
+    CLONE,
+    REFUSE,
+    VENDOR,
+    DecisionInputs,
+    decide,
+    requires_metered_approval,
+    write_decision_record,
+)
 from kata_forge.deps import classify_repo
 from kata_forge.license_gate import detect_license
+from kata_forge.metered import load_metered_policy
 from kata_forge.onboard import INTEGRATION_DECISION_FILENAME
 from kata_forge.pinned_fetch import compartment_git_runner, fetch_pinned
 from kata_forge.redaction import scan_embedded_secrets
@@ -806,6 +815,7 @@ def build(
     source_repo: str = "",
     drafter=None,
     draft_verifier=None,
+    metered_policy_path: str | Path | None = None,
 ) -> BuildResult:
     """Run the whole chain and emit one immutable bundle. Never writes live state.
 
@@ -834,6 +844,19 @@ def build(
             "kata-bot refuses a registry lane without one")
     if not _SOURCE_REPO_RE.fullmatch(source_repo):
         raise BuildError("--source-repo must be an owner/repo slug")
+    # A metered approval is a BUILD INPUT, not a runtime flag: it is loaded and validated here, in
+    # preflight, so a malformed or credential-carrying policy stops the build before anything is
+    # fetched, and it enters ``decision_inputs_sha256`` below so that approving different limits
+    # yields a different build id rather than silently reusing the bundle reviewed under the old ones.
+    metered_evidence: dict | None = None
+    if metered_policy_path is not None:
+        policy = load_metered_policy(metered_policy_path)
+        if int(policy.subnet_id) != int(spec.subnet_number):
+            raise BuildError(
+                f"metered policy approves subnet {policy.subnet_id}, but this build is for subnet "
+                f"{spec.subnet_number}; an approval is not transferable between subnets")
+        metered_evidence = policy.as_evidence()
+
     plugin_source_digest = _source_tree_digest(plugin_source)
     build_tools_digest = (
         "injected-wheel-builder"
@@ -846,6 +869,7 @@ def build(
         "vendor_entangled": sorted(vendor_entangled or []),
         "vendor_files": sorted(vendor_files or []),
         "parity": parity or {},
+        "metered_policy": metered_evidence,
     })
     ai_config_digest = _canonical_digest({
         "provider": os.environ.get("KATA_FORGE_LLM", ""),
@@ -957,7 +981,7 @@ def build(
                           _refuse, wheel_builder, allow_gpu, vendor_closure_files,
                           vendor_entangled, vendor_files, parity, kata_rev,
                           kata_tree_hash, plugin_contract_version, plugin_source,
-                          source_repo, drafter, draft_verifier)
+                          source_repo, drafter, draft_verifier, metered_evidence)
     except (BuildError, TrustedInputError):
         raise
     except BaseException as exc:
@@ -968,7 +992,7 @@ def build(
 def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, wheel_builder,
                 allow_gpu, vendor_closure_files, vendor_entangled, vendor_files, parity, kata_rev,
                 kata_tree_hash, plugin_contract_version, plugin_source=None, source_repo="",
-                drafter=None, draft_verifier=None) -> BuildResult:
+                drafter=None, draft_verifier=None, metered_evidence=None) -> BuildResult:
     # 3 RESEARCH -- the credential scan first, so a leak stops the build before any AI input.
     state.phase = "research"
     write_build_state(staging, state)
@@ -994,6 +1018,8 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
         vendor_files=exact_vendor_files,
         vendor_entangled=list(vendor_entangled or []), parity=dict(parity or {}),
         allow_gpu=allow_gpu,
+        paid_providers=list(cost.paid_providers),
+        metered_policy=metered_evidence,
     ))
     write_decision_record(staging / INTEGRATION_DECISION_FILENAME, decision)
     if decision.mode == REFUSE:
@@ -1075,6 +1101,20 @@ def _run_phases(staging, final, state, spec, pinned, inputs, build_id, _refuse, 
         }
     else:  # fixed policy currently has only these two non-refusal outcomes
         return _refuse(f"unsupported integration mode {decision.mode!r}", "integrate")
+
+    # A PAID lane must SAY SO in the manifest. Reaching here with a metered source means the cost
+    # gate was satisfied by an explicit approval, and the bundle records which providers the survey
+    # actually found alongside the approval that covers them -- the trusted installer re-checks both
+    # against a root-owned record it reads itself, so this section is a declaration, never a warrant.
+    if requires_metered_approval(cost.cost_class, deps.verdict, cost.paid_providers):
+        if metered_evidence is None:  # unreachable: _cost_gates refuses first. Fail closed anyway.
+            return _refuse("metered source reached integration without an approval", "integrate")
+        integration["metered"] = {
+            **metered_evidence,
+            "observed_providers": sorted(cost.paid_providers),
+            "cost_class": cost.cost_class,
+            "dep_verdict": deps.verdict,
+        }
 
     # 8 verify. The wheel is built in the Verify compartment: a build backend is
     # untrusted code and must not run on the build host.
