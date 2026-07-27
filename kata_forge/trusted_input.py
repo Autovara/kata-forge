@@ -97,8 +97,7 @@ def parse_canonical_github_url(raw: object) -> CanonicalRepo:
         raise TrustedInputError(
             f"repository URL must have exactly two path segments (owner/repo), got {segments}: {raw!r}")
     owner, repo = segments
-    if repo.endswith(".git"):
-        repo = repo[: -len(".git")]
+    repo = repo.removesuffix(".git")
     if repo in ("", ".", ".."):
         raise TrustedInputError(f"invalid repository name in {raw!r}")
     if ".." in repo or ".." in owner:

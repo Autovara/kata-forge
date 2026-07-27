@@ -86,7 +86,7 @@ def parse_requirements(text: str) -> list[str]:
     out: list[str] = []
     for raw in text.splitlines():
         line = raw.strip()
-        if not line or line.startswith("#") or line.startswith("-"):
+        if not line or line.startswith(("#", "-")):
             continue
         if "://" in line or line.startswith("git+"):
             continue

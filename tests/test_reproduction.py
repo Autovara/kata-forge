@@ -51,7 +51,7 @@ print("DISCOVERY_OK")
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
 def test_generated_skeleton_installs_runs_and_is_discoverable(tmp_path) -> None:

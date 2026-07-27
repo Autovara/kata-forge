@@ -3,7 +3,13 @@ from __future__ import annotations
 import json
 
 from kata_forge.cli import main
-from kata_forge.lane_config import apply_lane_to_env, editable_path, env_patch, lane_entry, render_snippet
+from kata_forge.lane_config import (
+    apply_lane_to_env,
+    editable_path,
+    env_patch,
+    lane_entry,
+    render_snippet,
+)
 from kata_forge.spec import validate_spec
 
 SPEC = validate_spec(subnet_number=126, pack="sn126__poker44", evaluator_id="sn126_poker44")

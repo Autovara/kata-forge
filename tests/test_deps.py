@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -16,19 +17,17 @@ POKER44 = Path("/tmp/poker44-research")
 
 
 def test_parse_requirements_strips_specs_and_noise() -> None:
-    text = "\n".join(
-        [
-            "numpy>=1.24",
-            "scikit-learn>=1.3  # scorer",
-            "requests>=2.31 ; python_version>'3.8'",
-            "",
-            "# a comment",
-            "-r base.txt",
-            "-e .",
-            "git+https://example.com/x.git",
-            "foo[bar]==1.0",
-        ]
-    )
+    text = textwrap.dedent("""\
+        numpy>=1.24
+        scikit-learn>=1.3  # scorer
+        requests>=2.31 ; python_version>'3.8'
+
+        # a comment
+        -r base.txt
+        -e .
+        git+https://example.com/x.git
+        foo[bar]==1.0
+        """)
     assert parse_requirements(text) == ["numpy", "scikit-learn", "requests", "foo"]
 
 

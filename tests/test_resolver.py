@@ -23,7 +23,8 @@ def _make_git_repo(path: Path) -> str:
     subprocess.run(["git", "-C", str(path), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(path), *env, "commit", "-q", "-m", "init"], check=True)
     return subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=False,
     ).stdout.strip()
 
 

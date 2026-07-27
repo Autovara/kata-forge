@@ -70,8 +70,9 @@ class CanaryFailure(Exception):
 
 def _probe_read(path: str) -> list[str]:
     """A command that exits 0 ONLY if the path was actually readable."""
-    return ["/bin/sh", "-c", f'if [ -r "{path}" ] && head -c1 "{path}" >/dev/null 2>&1; '
-                             f'then echo REACHED; exit 0; else exit 7; fi']
+    return ["/bin/sh", "-c",
+            (f'if [ -r "{path}" ] && head -c1 "{path}" >/dev/null 2>&1; '
+             f'then echo REACHED; exit 0; else exit 7; fi')]
 
 
 #: Interpreter used for the egress probe. NOT /bin/sh: on Debian/Ubuntu that is dash, which has no

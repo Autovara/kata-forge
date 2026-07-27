@@ -41,7 +41,7 @@ def registry_resolver(mapping: dict[int, str]) -> SubnetResolver:
 
 
 def _run_git(args: list[str]) -> tuple[int, str, str]:
-    completed = subprocess.run(["git", *args], capture_output=True, text=True)  # noqa: S603,S607
+    completed = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
     return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
 
 

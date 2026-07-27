@@ -235,7 +235,7 @@ def run_in_compartment(
         completed = subprocess.run(
             command, capture_output=True, text=True, env=dict(CLEAN_ENV),
             timeout=compartment.max_wall_seconds, check=False,
-            preexec_fn=_apply_rlimits(compartment),  # noqa: PLW1509 - bounding untrusted work
+            preexec_fn=_apply_rlimits(compartment),
         )
     except subprocess.TimeoutExpired:
         return CompartmentRun(compartment=compartment.name, returncode=124, stdout="",

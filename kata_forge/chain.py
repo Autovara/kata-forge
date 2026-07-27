@@ -58,7 +58,7 @@ def bittensor_chain_client(network: str = "finney") -> ChainClient:
 
     try:
         subtensor = bt.subtensor(network=network)
-    except Exception as error:  # noqa: BLE001 - any connection/setup failure degrades the same way
+    except Exception as error:
         raise RepoResolveError(
             f"could not reach the bittensor {network} chain ({error}); pass --repo <url|path>"
         ) from error
