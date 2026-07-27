@@ -54,6 +54,23 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--force", action="store_true", help="Overwrite an existing scaffold.")
     extract.add_argument("--llm", action="store_true", help="Opt-in: draft the stubs via KATA_FORGE_LLM.")
 
+    # S5: the PRODUCTION input path. Deliberately separate from `extract`, which stays permissive
+    # (local paths, unpinned) for offline research. This one refuses anything that is not a canonical
+    # public GitHub repository, and stops at the decision rather than scaffolding.
+    decide_cmd = subcommands.add_parser(
+        "decide", help="Resolve a canonical validator repo and decide VENDOR/CLONE/REFUSE (S5).")
+    decide_cmd.add_argument("--repo", default=None,
+                            help="Canonical https://github.com/<owner>/<repo> URL.")
+    decide_cmd.add_argument("--subnet", type=int, default=None,
+                            help="Subnet number, resolved ONLY through --catalog.")
+    decide_cmd.add_argument("--catalog", default=None,
+                            help="Local versioned subnet-catalog.json (required with --subnet).")
+    decide_cmd.add_argument("--commit", default=None, help="Pin at this full 40-character sha.")
+    decide_cmd.add_argument("--work-dir", required=True, help="Where to clone the pinned source.")
+    decide_cmd.add_argument("--out", required=True, help="Where to write integration-decision.json.")
+    decide_cmd.add_argument("--allow-gpu", action="store_true",
+                            help="Explicitly permit a GPU-requiring validator.")
+
     survey = subcommands.add_parser("survey", help="Rank many local repos as onboarding candidates.")
     survey.add_argument("paths", nargs="+", help="Local repo paths to analyze and rank.")
     survey.add_argument("--out", default="", help="Write the ranked table to this file.")
@@ -174,12 +191,47 @@ def _run_extract(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_decide(args: argparse.Namespace) -> int:
+    """Run the S5 decision pipeline. Exit 0 for VENDOR/CLONE, 2 for REFUSE, 2 for a refused input.
+
+    A REFUSE is a successful RUN with a negative RESULT, so it still writes a decision record — that
+    record is exactly what a human reads to decide whether to override.
+    """
+    from kata_forge.onboard import run_decision_pipeline
+    from kata_forge.pinned_fetch import PinnedFetchError
+    from kata_forge.trusted_input import TrustedInputError
+
+    try:
+        result = run_decision_pipeline(
+            repo=args.repo,
+            subnet=args.subnet,
+            catalog_path=args.catalog,
+            work_dir=args.work_dir,
+            out_dir=args.out,
+            commit=args.commit,
+            allow_gpu=args.allow_gpu,
+        )
+    except (TrustedInputError, PinnedFetchError) as error:
+        # No record is written: without a canonical, pinned source there is nothing to record ABOUT.
+        print(f"kata-forge: REFUSE / NEEDS-HUMAN: {error}", file=sys.stderr)
+        return 2
+
+    decision = result.decision
+    print(f"kata-forge: {decision.mode} {result.canonical.url}@{result.pinned.commit[:12]}")
+    for reason in decision.reasons:
+        print(f"  - {reason}")
+    print(f"  record: {result.record_path}")
+    return 2 if decision.refused else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "extract":  # extract takes --repo/--subnet, not a full spec
         return _run_extract(args)
     if args.command == "survey":  # survey takes repo paths, not a spec
         return _run_survey(args)
+    if args.command == "decide":  # S5 takes a canonical repo/subnet, not a spec
+        return _handle_decide(args)
     try:
         spec = spec_from_args(args)
     except SpecError as error:
