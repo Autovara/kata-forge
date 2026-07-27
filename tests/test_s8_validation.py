@@ -18,6 +18,7 @@ onboarded by hand before this automation existed.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -44,6 +45,9 @@ SN60_COMMIT = "069ae1e2f152370fa97f3397d8a8f8aed5a78539"
 
 #: A subnet neither reference covers.
 THIRD_REPO = "https://github.com/Datura-ai/desearch"
+
+MIT = ("MIT License\n\nPermission is hereby granted, free of charge, to any person obtaining "
+       "a copy\n")
 
 
 def _online() -> bool:
@@ -178,3 +182,90 @@ def test_no_real_repo_ships_an_embedded_credential(tmp_path):
                                ("sandbox", SN60_REPO, SN60_COMMIT)):
         source = fetch_pinned(parse_canonical_github_url(repo), tmp_path / name, commit=commit)
         assert scan_embedded_secrets(source.path) == [], f"{name} tripped the credential scanner"
+
+
+# ---- a CLONE bundle with a genuinely executed parity fixture -------------------------------------
+def test_a_clone_bundle_is_emitted_from_a_real_executed_parity_fixture(tmp_path):
+    """S8's CLONE criterion, exercised rather than assumed.
+
+    Definition-of-done item 3 requires "a pinned full commit with an executed parity fixture -- only
+    if CLONE". Every other CLONE assertion in this suite feeds the decision a parity *evidence dict*.
+    This one actually RUNS a fixture: two independent implementations of the same scoring rule are
+    executed over real cases and compared, and only then is the mode selected.
+    """
+    from kata_forge.build import build
+    from kata_forge.spec import SubnetSpec
+
+    # Two independent implementations of one rule: an "upstream" scorer and the adapter that Kata
+    # would drive it through. Agreement is what earns CLONE.
+    def upstream(payload):
+        hands, bots = payload
+        return round(sum(bots) / max(len(hands), 1), 6)
+
+    def adapter(payload):
+        hands, bots = payload
+        total = 0.0
+        for flag in bots:
+            total += flag
+        return round(total / max(len(hands), 1), 6)
+
+    cases = [ParityCase("all-human", ([1, 2, 3], [0, 0, 0])),
+             ParityCase("mixed", ([1, 2, 3, 4], [1, 0, 1, 0])),
+             ParityCase("all-bot", ([1, 2], [1, 1]))]
+    parity = run_parity_fixture(cases, upstream=upstream, adapter=adapter)
+    assert parity.executed and parity.cases_run == 3 and parity.qualifies_for_clone
+
+    out_root = tmp_path / "out"
+    out_root.mkdir(mode=0o700)
+
+    class LocalGit:
+        """A pinned upstream whose shape forces CLONE: entangled and far too large to vendor."""
+
+        def __call__(self, args):
+            sub = next((a for a in args if a in ("clone", "checkout", "rev-parse")), None)
+            if sub == "clone":
+                dest = Path(args[-1])
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / "LICENSE").write_text(MIT, encoding="utf-8")
+                (dest / "requirements.txt").write_text("numpy\n", encoding="utf-8")
+                (dest / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+                for index in range(40):
+                    (dest / f"mod_{index}.py").write_text("x = 1\n", encoding="utf-8")
+                return (0, "", "")
+            return (0, "d" * 40, "") if sub == "rev-parse" else (0, "", "")
+
+    def _wheel(_plugin_dir, dist_dir):
+        dist_dir.mkdir(parents=True, exist_ok=True)
+        wheel = dist_dir / "kata_sn77-0.1.0-py3-none-any.whl"
+        wheel.write_text("wheel", encoding="utf-8")
+        return wheel
+
+    result = build(
+        output_root=out_root,
+        spec=SubnetSpec(subnet_number=77, pack="sn77__parity", evaluator_id="sn77_parity",
+                        name="parity"),
+        repo="https://github.com/Autovara/parity-demo",
+        kata_rev="k", kata_bot_rev="b", kata_forge_rev="f", kata_tree_hash="a" * 64,
+        git_runner=LocalGit(), wheel_builder=_wheel,
+        vendor_closure_files=44, vendor_entangled=["docker"],
+        parity=parity.as_evidence(),
+    )
+
+    assert result.mode == CLONE, "an entangled tree with a passing parity fixture must CLONE"
+    decision = json.loads((result.bundle_dir / "integration-decision.json").read_text())
+    assert decision["mode"] == CLONE
+    assert decision["evidence"]["parity"]["executed"] is True
+    assert decision["evidence"]["parity"]["cases_run"] == 3
+    assert decision["evidence"]["source"]["commit"] == "d" * 40  # pinned full commit
+
+
+def test_a_clone_is_refused_when_the_same_fixture_disagrees(tmp_path):
+    """The control: change one implementation so the fixture genuinely fails, and CLONE must not be
+    selected. Without this, the test above would pass against a fixture that never compared."""
+    parity = run_parity_fixture(
+        [ParityCase("mixed", ([1, 2, 3, 4], [1, 0, 1, 0]))],
+        upstream=lambda payload: round(sum(payload[1]) / len(payload[0]), 6),
+        adapter=lambda payload: 0.0,   # a wrong adapter
+    )
+    assert parity.executed and not parity.qualifies_for_clone
+    assert parity.mismatches
